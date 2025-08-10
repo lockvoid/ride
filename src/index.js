@@ -246,7 +246,7 @@ export class Component {
     this._preReadyDiffRan = false;    // diff() already ran pre-ready
     this._initDone = false;
     this._diffTicket = 0;
-    this._defaultPriority = this.constructor?.progressive?.priority ?? null;
+    this._defaultPriority = this.constructor?.progressive?.priority ?? 0;
 
     // node
     this.node = null;
@@ -375,7 +375,7 @@ export class Component {
 
   queue(type, payload, opts = {}) {
     const { key, coalesceBy = null, squash = null } = opts;
-    const priority = (opts.priority ?? 0);
+    const priority = this._defaultPriority + (opts.priority ?? 0);
     const coalesceKey = coalesceBy ? coalesceBy(type, payload) : (key ?? type);
 
     this._cmds.push({ type, key: coalesceKey, payload, priority, squash });
@@ -416,7 +416,7 @@ export class Component {
       type: '@ride/init',
       key,
       payload: null,
-      priority: -1,
+      priority: this._defaultPriority - 1,
       squash: (prev) => prev,
     });
     // Do NOT schedule RAF before ready.

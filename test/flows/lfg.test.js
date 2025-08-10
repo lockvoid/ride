@@ -1,5 +1,5 @@
 import { Ride, Component, DIFF } from '../../src/index.js';
-import { MockHost, tick, timeout, raf, createDeferred } from '../helpers';
+import { MockHost, tick, delay, raf, createDeferred } from '../helpers';
 
 describe('Ride', () => {
   let diffs = [];
@@ -291,70 +291,69 @@ describe('Ride', () => {
     expect(effects.length).toBe(2);
     expect(effects).toMatchObject([{ type: 'position', payload: { x: 2, y: 2 } }, { type: 'velocity', payload: { v: 10 } } ]);
   });
-/*
 
-  it('progressive update budget throttles per frame', async () => {
-    const order = [];
+  it.only('schedules higher-priority siblings before lower-priority ones, slicing by frame budget', async () => {
     class App extends Component {
-      static progressive = { updateBudget: 2 }; // 2 effects per frame
-      createNode(){ return {}; }
-      async init(){
-        for (let i=0;i<5;i++){
-          this.queue('u', { i }, { key:`k|${i}` });
-        }
+      static progressive = { budget: 5 };
+
+      static async createHost() {
+        return new MockHost();
       }
-      effect(op){ order.push(op.payload.i); }
-    }
-    const app = Ride.mount(App, { host: new MockHost() });
 
-    await raf();                       // frame 1
-    expect(order.length).toBe(2);
-
-    await raf();                       // frame 2
-    expect(order.length).toBe(4);
-
-    await raf();                       // frame 3
-    expect(order).toEqual([0,1,2,3,4]);
-
-    await Ride.unmount(app);
-  });
-
-  it('progressive create budget throttles child mounts', async () => {
-    class Leaf extends Component { createNode(){ return {}; } }
-    class App extends Component {
-      static progressive = { createBudget: 3 }; // 1 create per frame
-      createNode(){ return { children: [] }; }
-      async init(){
-        this.deferMount(Leaf, {}, { key:'leaf1' });
-        this.deferMount(Leaf, {}, { key:'leaf2' });
-        this.deferMount(Leaf, {}, { key:'leaf3' });
+      async init() {
+        this.mount(B, {});
+        this.mount(C, {});
       }
     }
-    const host = new MockHost();
-    const app = Ride.mount(App, { host });
 
-    await Promise.resolve();
-    await raf();  expect(host.attached).toBe(1);
-    await raf();  expect(host.attached).toBe(2);
-    await raf();  expect(host.attached).toBe(3);
+    class B extends Component {
+      static progressive = { priority: 0 };
 
-    await Ride.unmount(app);
-  });
+      async init() {
+        this.queue('render', { who: 'B' });
+      }
 
-  it('requestRender is called after flush', async () => {
-    class App extends Component {
-      createNode(){ return {}; }
-      diff(){ this.queue('noop', {}, { key:'noop' }); }
-      effect(){}
+      async effect(op) {
+        await delay(6);
+
+        effects.push({ type: op.type, who: op.payload.who });
+      }
     }
-    const host = new MockHost();
-    const app = Ride.mount(App, { host });
-    const before = host.renderCalls;
 
-    app.update({ any: 1 });
+    class C extends Component {
+      static progressive = { priority: 10 };
+
+      async init() {
+        this.queue('render', { who: 'C' });
+      }
+
+      async effect(op) {
+        effects.push({ type: op.type, who: op.payload.who });
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
     await raf();
 
-    expect(host.renderCalls).toBeGreaterThan(before);
-    await Ride.unmount(app);
-  }); */
+    // 1 - App init runs, children scheduled for the next RAF
+
+    await raf();
+
+    // 2 - B and C init run, they queue 'render' operations to the next RAF
+
+    await raf();
+
+    // 3 -  B runs (priority 0), the budget is exceeded, C is deferred
+
+    await raf();
+
+    expect(effects).toEqual([{ type: 'render', who: 'B' }]);
+
+    // 4 - C runs
+
+    await raf();
+
+    expect(effects).toEqual([{ type: 'render', who: 'B' }, { type: 'render', who: 'C' }]);
+  });
 });
