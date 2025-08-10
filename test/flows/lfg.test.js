@@ -459,48 +459,49 @@ describe('Ride', () => {
       }
 
       async init() {
-        this.mount(B, {});
-        this.mount(C, {});
-        this.mount(D, {});
+        for (let i = 0; i < 3; i++) {
+          this.mount(Item, { id: i });
+        }
       }
     }
 
-    class B extends Component {
+    class Item extends Component {
       static progressive = { priority: 0 };
 
       async init() {
-        this.queue('render', { who: 'B' });
+        this.mount(ItemInfo, { id: this.props.id });
+        this.mount(ItemPicture, { id: this.props.id });
+
+        this.queue('render', { who: `Item ${this.props.id}` });
       }
 
       async effect(op) {
-        await delay(6);
-
         effects.push({ type: op.type, who: op.payload.who });
       }
     }
 
-    class C extends Component {
+    class ItemPicture extends Component {
       static progressive = { priority: 10 };
 
       async init() {
-        this.queue('render', { who: 'C' });
-      }
-
-      async effect(op) {
-        effects.push({ type: op.type, who: op.payload.who });
-      }
-    }
-
-    class D extends Component {
-      static progressive = { priority: 20 };
-
-      async init() {
-        this.queue('render', { who: 'D' });
+        this.queue('render', { who: `ItemPicture ${this.props.id}` });
       }
 
       async effect(op) {
         await delay(6);
 
+        effects.push({ type: op.type, who: op.payload.who });
+      }
+    }
+
+    class ItemInfo extends Component {
+      static progressive = { priority: 5 };
+
+      async init() {
+        this.queue('render', { who: `ItemInfo ${this.props.id}` });
+      }
+
+      async effect(op) {
         effects.push({ type: op.type, who: op.payload.who });
       }
     }
@@ -509,24 +510,67 @@ describe('Ride', () => {
 
     await raf();
 
-    // 1 - App init runs, children scheduled for the next RAF
+    // 1
 
     await raf();
 
-    // 2 - B and C init run, they queue 'render' operations to the next RAF
+    // 2
 
     await raf();
 
-    // 3 -  B runs (priority 0), the budget is exceeded, C is deferred
+    // 3
 
     await raf();
 
-    expect(effects).toEqual([{ type: 'render', who: 'B' }]);
+    expect(effects).toEqual([
+      { type: 'render', who: 'Item 0' },
+      { type: 'render', who: 'Item 1' },
+      { type: 'render', who: 'Item 2' },
+    ]);
 
-    // 4 - C, D runs
+    // 4
 
     await raf();
 
-    expect(effects).toEqual([{ type: 'render', who: 'B' }, { type: 'render', who: 'C' }, { type: 'render', who: 'D' }]);
+    expect(effects).toEqual([
+      { type: 'render', who: 'Item 0' },
+      { type: 'render', who: 'Item 1' },
+      { type: 'render', who: 'Item 2' },
+      { type: 'render', who: 'ItemInfo 0' },
+      { type: 'render', who: 'ItemInfo 1' },
+      { type: 'render', who: 'ItemInfo 2' },
+      { type: 'render', who: 'ItemPicture 0' },
+    ]);
+
+    // 5
+
+    await raf();
+
+    expect(effects).toEqual([
+      { type: 'render', who: 'Item 0' },
+      { type: 'render', who: 'Item 1' },
+      { type: 'render', who: 'Item 2' },
+      { type: 'render', who: 'ItemInfo 0' },
+      { type: 'render', who: 'ItemInfo 1' },
+      { type: 'render', who: 'ItemInfo 2' },
+      { type: 'render', who: 'ItemPicture 0' },
+      { type: 'render', who: 'ItemPicture 1' },
+    ]);
+
+    // 6
+
+    await raf();
+
+    expect(effects).toEqual([
+      { type: 'render', who: 'Item 0' },
+      { type: 'render', who: 'Item 1' },
+      { type: 'render', who: 'Item 2' },
+      { type: 'render', who: 'ItemInfo 0' },
+      { type: 'render', who: 'ItemInfo 1' },
+      { type: 'render', who: 'ItemInfo 2' },
+      { type: 'render', who: 'ItemPicture 0' },
+      { type: 'render', who: 'ItemPicture 1' },
+      { type: 'render', who: 'ItemPicture 2' },
+    ]);
   });
 });
