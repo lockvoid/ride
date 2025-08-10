@@ -292,7 +292,7 @@ describe('Ride', () => {
     expect(effects).toMatchObject([{ type: 'position', payload: { x: 2, y: 2 } }, { type: 'velocity', payload: { v: 10 } } ]);
   });
 
-  it.only('schedules higher-priority siblings before lower-priority ones, slicing by frame budget', async () => {
+  it('schedules higher-priority siblings before lower-priority ones, slicing by frame budget', async () => {
     class App extends Component {
       static progressive = { budget: 5 };
 
@@ -303,6 +303,7 @@ describe('Ride', () => {
       async init() {
         this.mount(B, {});
         this.mount(C, {});
+        this.mount(D, {});
       }
     }
 
@@ -332,6 +333,20 @@ describe('Ride', () => {
       }
     }
 
+    class D extends Component {
+      static progressive = { priority: 20 };
+
+      async init() {
+        this.queue('render', { who: 'D' });
+      }
+
+      async effect(op) {
+        await delay(6);
+
+        effects.push({ type: op.type, who: op.payload.who });
+      }
+    }
+
     const app = Ride.mount(App, {});
 
     await raf();
@@ -350,10 +365,10 @@ describe('Ride', () => {
 
     expect(effects).toEqual([{ type: 'render', who: 'B' }]);
 
-    // 4 - C runs
+    // 4 - C, D runs
 
     await raf();
 
-    expect(effects).toEqual([{ type: 'render', who: 'B' }, { type: 'render', who: 'C' }]);
+    expect(effects).toEqual([{ type: 'render', who: 'B' }, { type: 'render', who: 'C' }, { type: 'render', who: 'D' }]);
   });
 });
