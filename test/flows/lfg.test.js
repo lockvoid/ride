@@ -64,6 +64,7 @@ describe('Ride', () => {
 
     expect(buffer.length).toBe(2);
     expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }]);
+    expect(effects.length).toBe(0);
 
     // 2
 
@@ -73,6 +74,7 @@ describe('Ride', () => {
 
     expect(app.getCommandBuffer().length).toBe(3);
     expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }]);
+    expect(effects.length).toBe(0);
 
     // 3
 
@@ -82,6 +84,7 @@ describe('Ride', () => {
 
     expect(app.getCommandBuffer().length).toBe(4);
     expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(effects.length).toBe(0);
 
     // 4
 
@@ -91,6 +94,7 @@ describe('Ride', () => {
 
     expect(app.getCommandBuffer().length).toBe(4);
     expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(effects.length).toBe(0);
 
     // 5
 
@@ -100,16 +104,14 @@ describe('Ride', () => {
 
     expect(app.getCommandBuffer().length).toBe(4);
     expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(effects.length).toBe(0);
 
     await raf();
 
     expect(app.getCommandBuffer().length).toBe(0);
-    expect(buffer.ops).toBe([]);
-
-    // expect(effects[0]).toMatchObject({
-    //   type: 'foo',
-    //   payload: { prev: {}, next: { foo: 1 } },
-    // });
+    expect(buffer.ops).toStrictEqual([]);
+    expect(effects.length).toBe(3);
+    expect(effects).toMatchObject([{ type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
   });
 
   it('defers effects', async () => {

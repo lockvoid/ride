@@ -1,21 +1,19 @@
 // core.js
 // Renderer-agnostic microframework core
-// - Sync Ride.mount (host boots async; updates are buffered)
-// - Async-friendly diff() with transactional commits via DIFF.DEFER
-// - Pay-as-you-go priorities (only prioritized ops are sorted; others are FIFO)
+// - Sync Ride.mount (host boots async; updates can buffer)
+// - Pre-ready diff buffering: diff() runs pre-ready, queues ops, no prop commit
+// - Progressive frame budget: root static progressive = { budget: ms }
+// - Per-component default priority: static progressive = { priority: number } (0 highest)
+// - Pay-as-you-go priorities (only prioritized ops sorted; others FIFO)
 // - Coalescing by custom key; optional payload squash per target
 // - getChildParent(child): parent controls where children attach
-// - Progressive frame budget: root static progressive = { budget: ms }
-// - Per-component default priority: static progressive = { priority: number }
-// - Pre-ready diff buffering: queue ops before host-ready; drain after init
-// - Internals swallowed: @ride/init never hits user effect()
+// - Internal ops swallowed (@ride/init)
 
-// ============================================================================
-// Constants
-// ============================================================================
+/* ============================================================================
+ * Constants
+ * ==========================================================================*/
 
 export const PRIORITY = Object.freeze({
-  // Lower number runs earlier. 0 = highest.
   HIGHEST: 0,
   HIGH: 10,
   MEDIUM: 50,
@@ -28,26 +26,22 @@ export const DIFF = Object.freeze({
   COMMIT: 1,
 });
 
-// ============================================================================
-// CommandBuffer - Manages operation queue with coalescing and priorities
-// ============================================================================
+/* ============================================================================
+ * CommandBuffer
+ * ==========================================================================*/
 
 class CommandBuffer {
   constructor() {
     this.generation = 0;
-    this.ops = [];              // FIFO lane (stable insertion order)
+    this.ops = [];              // public: tests rely on this
     this.index = new Map();     // coalesceKey -> index in ops[]
     this.size = 0;
     this.sequence = 0;          // stable tie-breaker for same priority
   }
 
-  get length() {
-    return this.size;
-  }
+  get length() { return this.size; }
 
-  nextGen() {
-    this.generation++;
-  }
+  nextGen() { this.generation++; }
 
   push({ type, key, payload, priority = null, squash = null }) {
     if (!type) throw new Error('op.type is required');
@@ -55,15 +49,11 @@ class CommandBuffer {
 
     const existingIndex = this.index.get(key);
     const newOp = {
-      type,
-      key,
-      payload,
-      priority,
+      type, key, payload, priority,
       generation: this.generation,
       sequence: ++this.sequence,
     };
 
-    // New operation - add to buffer
     if (existingIndex == null) {
       this.index.set(key, this.ops.length);
       this.ops.push(newOp);
@@ -71,41 +61,35 @@ class CommandBuffer {
       return;
     }
 
-    // Coalesce with existing operation
     const existingOp = this.ops[existingIndex];
-    const mergedPayload = squash
-      ? squash(existingOp.payload, payload, existingOp, newOp)
-      : payload;
+    const mergedPayload = squash ? squash(existingOp.payload, payload, existingOp, newOp) : payload;
 
-    // Keep original position & sequence for stable ordering
     this.ops[existingIndex] = {
       ...newOp,
       payload: mergedPayload,
-      sequence: existingOp.sequence,
+      sequence: existingOp.sequence, // keep original order
     };
   }
 
   /**
    * Budget-aware drain: calls effect(op) until shouldYield() is true.
-   * Returns true if fully drained, false if it yielded with leftovers re-queued.
+   * Returns true if fully drained, false if yielded with leftovers re-queued.
    */
   async drain(effect, shouldYield) {
     const prioritized = [];
     const unprioritized = [];
 
-    // Separate prioritized and unprioritized operations
     for (const op of this.ops) {
       if (!op) continue;
       (op.priority == null ? unprioritized : prioritized).push(op);
     }
 
-    // Sort only prioritized ops (cheap); FIFO is already stable
-    // LOWER priority numbers run first. 0 = highest, larger = lower.
+    // 0 = highest, larger = lower; tie-break by insertion sequence (stable)
     prioritized.sort((a, b) =>
       (a.priority - b.priority) || (a.sequence - b.sequence),
     );
 
-    // We'll rebuild ops if we yield. For now, clear and process in order.
+    // clear; rebuild if we yield
     this.ops.length = 0;
     this.index.clear();
 
@@ -116,29 +100,28 @@ class CommandBuffer {
       for (let i = 0; i < queue.length; i++) {
         const op = queue[i];
         if (shouldYield()) {
-          // Re-queue remaining ops: current op + rest of this queue + all remaining queues
           const remaining = queue.slice(i);
-          const tailQueues = queues.slice(qi + 1);
-          const leftover = remaining.concat(...tailQueues);
+          const tail = queues.slice(qi + 1);
+          const leftover = remaining.concat(...tail);
           for (const lf of leftover) {
             this.index.set(lf.key, this.ops.length);
             this.ops.push(lf);
           }
           this.size = this.ops.length;
-          return false; // NOT fully drained
+          return false;
         }
         await effect(op);
       }
     }
 
     this.size = 0;
-    return true; // fully drained
+    return true;
   }
 }
 
-// ============================================================================
-// Scheduler - Manages dirty components and RAF-based flushing with budget
-// ============================================================================
+/* ============================================================================
+ * Scheduler (RAF + budget)
+ * ==========================================================================*/
 
 class Scheduler {
   constructor({ frameBudgetMs = 8 } = {}) {
@@ -165,74 +148,54 @@ class Scheduler {
     const shouldYield = () =>
       noBudget ? false : (performance.now() - this._frameStart) >= this.frameBudgetMs;
 
-    // Sort by depth for parent-first processing
-    const batch = [...this.dirty].sort((a, b) =>
-      (a._depth | 0) - (b._depth | 0),
-    );
+    // parent-first
+    const batch = [...this.dirty].sort((a, b) => (a._depth | 0) - (b._depth | 0));
     this.dirty.clear();
 
-    // If host not ready, keep items dirty and retry later
+    // if any not ready, do nothing this frame (buffers remain untouched)
     const anyNotReady = batch.some(c => !c.runtime.isReady);
     if (anyNotReady) {
-      batch.forEach(c => {
-        if (!c.runtime.isReady) this.dirty.add(c);
-      });
+      batch.forEach(c => { if (!c.runtime.isReady) this.dirty.add(c); });
       if (this.dirty.size) this._scheduleNext();
       return;
     }
 
-    // Process each component
     const hosts = new Set();
 
     for (const component of batch) {
-      // 1) Ensure node is attached (cheap, idempotent)
+      // attach node (idempotent)
       await component._ensureAttached();
 
-      // // 2) Ensure init runs first (as an internal op) and is swallowed
-      // if (!component._initDone) {
-      //   component._queueInitOp();
-      // }
-
-      // 3) Drain whatever is in the buffer (may include pre-ready ops and/or @ride/init)
+      // drain whatever is queued (may include @ride/init and pre-ready ops)
       if (component._cmds.size > 0) {
-        const fullyDrained = await component._cmds.drain(
+        const drained = await component._cmds.drain(
           component._effect.bind(component),
           shouldYield,
         );
-        if (!fullyDrained) this.dirty.add(component);
+        if (!drained) this.dirty.add(component);
       }
 
-      // 4) If @ is done and initial props not committed yet, commit NOW (no re-diff)
-      if (component._initDone && !component._hasInitialized) {
-        if (shouldYield()) {
-          this.dirty.add(component);
-          break;
-        }
-        await component._runInitialDiff(); // this commits props and may enqueue ops
+      // commit initial props if not yet committed (no re-diff if pre-ready diff ran)
+      if (!component._hasInitialized) {
+        if (shouldYield()) { this.dirty.add(component); break; }
+        await component._runInitialDiff();
 
-        // 5) Try draining those new ops in the SAME frame (budget permitting)
+        // try to drain ops queued by initial diff in the same frame
         if (component._cmds.size > 0 && !shouldYield()) {
-          const fullyDrained2 = await component._cmds.drain(
+          const drained2 = await component._cmds.drain(
             component._effect.bind(component),
             shouldYield,
           );
-          if (!fullyDrained2) this.dirty.add(component);
+          if (!drained2) this.dirty.add(component);
         }
       }
 
-      if (component.runtime?.host) {
-        hosts.add(component.runtime.host);
-      }
-
-      if (shouldYield()) break; // hard stop for this frame
+      if (component.runtime?.host) hosts.add(component.runtime.host);
+      if (shouldYield()) break;
     }
 
-    // Request render from all affected hosts
-    for (const host of hosts) {
-      host.requestRender?.();
-    }
+    for (const host of hosts) host.requestRender?.();
 
-    // If there is leftover dirty work, schedule the next frame
     if (this.dirty.size) this._scheduleNext();
   }
 
@@ -244,9 +207,9 @@ class Scheduler {
   }
 }
 
-// ============================================================================
-// Runtime - Manages host connection and readiness state
-// ============================================================================
+/* ============================================================================
+ * Runtime
+ * ==========================================================================*/
 
 class Runtime {
   constructor(scheduler) {
@@ -255,10 +218,7 @@ class Runtime {
     this.isReady = false;
 
     let resolveReady;
-    this.whenReady = new Promise(resolve => {
-      resolveReady = resolve;
-    });
-
+    this.whenReady = new Promise(resolve => { resolveReady = resolve; });
     this._resolveReady = (host) => {
       this.host = host;
       this.isReady = true;
@@ -267,58 +227,53 @@ class Runtime {
   }
 }
 
-// ============================================================================
-// Component - Base class for all components
-// ============================================================================
+/* ============================================================================
+ * Component
+ * ==========================================================================*/
 
 export class Component {
   constructor(props, runtime, parent = null) {
-    // Core references
+    // refs
     this.runtime = runtime;
     this.parent = parent;
     this._depth = parent ? (parent._depth + 1) : 0;
 
-    // Props management
-    this.props = props || {};           // Committed props
-    this._stagedProps = null;           // Pending props (accumulates updates)
+    // props
+    this.props = props || {};
+    this._stagedProps = null;
     this.prevProps = undefined;
 
-    // Internal state
+    // internals
     this._children = new Set();
     this._cmds = new CommandBuffer();
     this._destroyed = false;
 
-    this._hasInitialized = false;       // initial props committed
+    this._hasInitialized = false;     // initial props committed
     this._needsInitialDiff = true;
-    this._preReadyDiffRan = false;      // diff() already ran before host-ready
+    this._preReadyDiffRan = false;    // diff() already ran pre-ready
     this._initDone = false;
-    this._diffTicket = 0;               // Prevents stale async diff results
+    this._diffTicket = 0;
     this._defaultPriority = this.constructor?.progressive?.priority ?? null;
 
-    // Node management
+    // node
     this.node = null;
 
-    // Setup ready promise (host + parent ready)
+    // ready promise (host + parent)
     this._setupReadyPromise();
 
-    // Queue init immediately; it will run only after host is ready & node attached.
+    // enqueue init immediately; will run only after host is ready
     this._queueInitOp();
 
-    // Accept immediate updates (buffered if host not ready)
+    // allow immediate updates (pre-ready diff buffers ops)
     this.update(this.props);
   }
 
-  getCommandBuffer() {
-    return this._cmds;
-  }
+  getCommandBuffer() { return this._cmds; } // test helper (live object)
 
   _setupReadyPromise() {
-    const dependencies = [this.runtime.whenReady];
-    if (this.parent) {
-      dependencies.push(this.parent.ready);
-    }
-    // Do not run init/diff here; those are budgeted inside Scheduler.
-    this.ready = Promise.all(dependencies).then(() => {});
+    const deps = [this.runtime.whenReady];
+    if (this.parent) deps.push(this.parent.ready);
+    this.ready = Promise.all(deps).then(() => {});
   }
 
   async _ensureAttached() {
@@ -342,12 +297,10 @@ export class Component {
     const next = this._stagedProps ?? this.props;
 
     if (this._preReadyDiffRan) {
-      // We already ran diff pre-ready to buffer ops. Don’t run it again now.
-      // Just COMMIT the latest staged props.
+      // we already computed and queued ops pre-ready; just commit props now
       this.props = next;
       this._stagedProps = null;
     } else {
-      // Normal path: run the initial diff now (may queue ops).
       const result = await this._runDiff(prev, next);
       if (result !== DIFF.DEFER) {
         this.props = next;
@@ -358,29 +311,18 @@ export class Component {
     this._needsInitialDiff = false;
     this._hasInitialized = true;
 
-    // Schedule flush if operations were queued by diff()
-    if (this._cmds.size) {
-      this.runtime.scheduler.markDirty(this);
-    }
+    if (this._cmds.size) this.runtime.scheduler.markDirty(this);
   }
 
   async _runDiff(prev, next) {
     const ticket = ++this._diffTicket;
-
     let result = this.diff(prev, next);
-    if (result && typeof result.then === 'function') {
-      result = await result;
-    }
-
-    // Discard stale results from concurrent diffs
-    if (ticket !== this._diffTicket) {
-      return DIFF.DEFER;
-    }
-
+    if (result && typeof result.then === 'function') result = await result;
+    if (ticket !== this._diffTicket) return DIFF.DEFER; // stale
     return result === DIFF.DEFER ? DIFF.DEFER : DIFF.COMMIT;
   }
 
-  // Swallows internal ops, forwards only user ops.
+  // swallow internal ops; forward user ops to effect()
   async _effect(op) {
     if (op.type === '@ride/init') {
       if (!this._initDone) {
@@ -388,19 +330,14 @@ export class Component {
         if (maybe && typeof maybe.then === 'function') await maybe;
         this._initDone = true;
       }
-      return; // swallow
-    }
-    if (op.type === '@ride/initial_diff') {
-      // currently not used in this flow; kept for compatibility
-      await this._runInitialDiff();
-      return; // swallow
+      return; // swallowed
     }
     if (typeof this.effect === 'function') {
-      return this.effect(op); // user-visible op
+      return this.effect(op);
     }
   }
 
-  // ===== Public API =====
+  /* ===== Public API ===== */
 
   update(patch) {
     if (this._destroyed) return;
@@ -418,7 +355,7 @@ export class Component {
       this._needsInitialDiff = false;
       this._processUpdate(prev, next);
     } else {
-      // Host not ready — run diff now to BUFFER ops, but force DEFER (no commit).
+      // host not ready — run diff now to buffer ops (always treated as DEFER)
       this._needsInitialDiff = true;
       this._processUpdatePreReady(prev, next);
     }
@@ -426,25 +363,21 @@ export class Component {
 
   async _processUpdate(prev, next) {
     const result = await this._runDiff(prev, next);
-
     if (this._destroyed) return;
-
     if (result !== DIFF.DEFER) {
       this.props = next;
       this._stagedProps = null;
     }
-    // Keep _stagedProps when deferring for accumulation
-
-    if (this._cmds.size) {
+    if (this.runtime.isReady && this._cmds.size) {
       this.runtime.scheduler.markDirty(this);
     }
   }
 
   async _processUpdatePreReady(prev, next) {
-    await this._runDiff(prev, next);   // queue ops; treat as DEFER regardless
-    this._preReadyDiffRan = true;      // so we won't re-run initial diff
-    // Do NOT commit props; initial commit will happen after host is ready.
-    this.runtime.scheduler.markDirty(this);
+    await this._runDiff(prev, next);   // queues ops; props not committed
+    this._preReadyDiffRan = true;
+    // IMPORTANT: do NOT schedule RAF while not ready — keep buffers stable
+    // First RAF will be scheduled when host becomes ready.
   }
 
   queue(type, payload, opts = {}) {
@@ -452,15 +385,12 @@ export class Component {
     const priority = (opts.priority ?? this._defaultPriority);
     const coalesceKey = coalesceBy ? coalesceBy(type, payload) : (key ?? type);
 
-    this._cmds.push({
-      type,
-      key: coalesceKey,
-      payload,
-      priority,
-      squash,
-    });
+    this._cmds.push({ type, key: coalesceKey, payload, priority, squash });
 
-    this.runtime.scheduler.markDirty(this);
+    // Do not schedule RAF before ready; keep buffer inspectable in tests.
+    if (this.runtime.isReady) {
+      this.runtime.scheduler.markDirty(this);
+    }
   }
 
   mount(ChildClass, props) {
@@ -470,34 +400,24 @@ export class Component {
   }
 
   async unmount(child) {
-    if (this._children.delete(child)) {
-      await child.destroy();
-    }
+    if (this._children.delete(child)) await child.destroy();
   }
 
   async destroy() {
     this._destroyed = true;
-
-    // Destroy all children
-    for (const child of this._children) {
-      await child.destroy();
-    }
+    for (const child of this._children) await child.destroy();
     this._children.clear();
 
-    // Detach and destroy node
     if (this.node && this.runtime.host) {
       const parentNode = this.node.parent ?? this.runtime.host.rootNode;
-      if (parentNode) {
-        this.runtime.host.detachNode(parentNode, this.node);
-      }
+      if (parentNode) this.runtime.host.detachNode(parentNode, this.node);
       this.runtime.host.destroyNode?.(this.node);
     }
   }
 
-  // === Progressive boot as ops ===
+  /* === internal boot === */
 
   _queueInitOp() {
-    // Coalesce by a fixed key so repeated scheduling doesn't duplicate
     const key = `@ride/init:${this._depth}:${this.constructor.name}`;
     this._cmds.push({
       type: '@ride/init',
@@ -506,46 +426,44 @@ export class Component {
       priority: this._defaultPriority ?? PRIORITY.HIGHEST,
       squash: (prev) => prev,
     });
-    this.runtime.scheduler.markDirty(this);
+    // Do NOT schedule RAF before ready.
+    if (this.runtime.isReady) {
+      this.runtime.scheduler.markDirty(this);
+    }
   }
 
-  // ===== Override points =====
+  /* ===== Override points ===== */
 
-  createNode() {
-    return this.runtime.host.createNode?.(this) ?? null;
-  }
+  createNode() { return this.runtime.host.createNode?.(this) ?? null; }
 
   async init() {
-    // Override in subclasses
+    // user hook, may be async, may queue ops
   }
 
-  getChildParent(_child) {
-    return this.node;
-  }
+  getChildParent(_child) { return this.node; }
 
   diff(_prev, _next) {
-    // Override in subclasses
+    // user override; may return DIFF.DEFER
   }
 
   async effect(_op) {
-    // Override in subclasses for user ops (internals are swallowed in _effect)
+    // user override for user ops
   }
 }
 
-// ============================================================================
-// Ride - Main framework API
-// ============================================================================
+/* ============================================================================
+ * Ride
+ * ==========================================================================*/
 
 export class Ride {
   static mount(AppClass, props) {
-    const frameBudgetMs = AppClass?.progressive?.budget ?? 8; // per-RAF budget
+    const frameBudgetMs = AppClass?.progressive?.budget ?? 8;
     const scheduler = new Scheduler({ frameBudgetMs });
     const runtime = new Runtime(scheduler);
 
-    // Create root component immediately
-    const app = new AppClass(props, runtime, null);
+    const app = new AppClass(props, runtime, null); // immediate
 
-    // Boot host asynchronously
+    // boot host async
     this._bootHost(AppClass, props, runtime, scheduler, app);
 
     return app;
@@ -553,11 +471,11 @@ export class Ride {
 
   static async _bootHost(AppClass, props, runtime, scheduler, app) {
     try {
-      const host = await AppClass.createHost?.(props);
+      const host = await AppClass.createHost?.(props); // may be deferred
       if (host) {
         host.isReady = true;
         runtime._resolveReady(host);
-        scheduler.markDirty(app); // Trigger first flush after ready
+        scheduler.markDirty(app); // first RAF after ready flushes everything
       }
     } catch (err) {
       console.error('Ride host init failed:', err);
