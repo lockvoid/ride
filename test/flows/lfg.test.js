@@ -27,20 +27,28 @@ describe('Ride', () => {
 
     await raf();
 
+    expect(diffs.length).toBe(0);
+
+    await raf();
+
     expect(diffs.length).toBe(1);
     expect(diffs[0]).toEqual({ prev: { foo: 1 }, next: { foo: 1 } });
   });
 
-  it('buffers operations before the host is ready', async () => {
+  it.only('buffers operations before the host is ready', async () => {
+    let buffer;
+
     const host = createDeferred();
 
     class App extends Component {
+      static progressive = { budget: Number.MAX_SAFE_INTEGER };
+
       static async createHost() {
         return host;
       }
 
       diff(prev = {}, next = {}) {
-        this.queue('foo', { prev, next });
+        this.queue(next.action, { prev, next });
       }
 
       effect(op) {
@@ -48,28 +56,60 @@ describe('Ride', () => {
       }
     }
 
-    const app = Ride.mount(App, {});
+    const app = Ride.mount(App, { action: 'foo' });
 
-    app.update({ foo: 1 });
+    // 1
 
-    expect(effects.length).toBe(0);
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(2);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }]);
+
+    // 2
+
+    app.update({ action: 'bar' });
+
+    buffer = app.getCommandBuffer();
+
+    expect(app.getCommandBuffer().length).toBe(3);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }]);
+
+    // 3
+
+    app.update({ action: 'qux' });
+
+    buffer = app.getCommandBuffer();
+
+    expect(app.getCommandBuffer().length).toBe(4);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+
+    // 4
 
     await raf();
 
-    expect(effects.length).toBe(0);
+    buffer = app.getCommandBuffer();
+
+    expect(app.getCommandBuffer().length).toBe(4);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+
+    // 5
 
     host.resolve(new MockHost());
 
-    await app.ready;
+    await raf();
+
+    expect(app.getCommandBuffer().length).toBe(4);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
 
     await raf();
 
-    expect(effects.length).toBe(1);
+    expect(app.getCommandBuffer().length).toBe(0);
+    expect(buffer.ops).toBe([]);
 
-    expect(effects[0]).toMatchObject({
-      type: 'foo',
-      payload: { prev: {}, next: { foo: 1 } },
-    });
+    // expect(effects[0]).toMatchObject({
+    //   type: 'foo',
+    //   payload: { prev: {}, next: { foo: 1 } },
+    // });
   });
 
   it('defers effects', async () => {
@@ -93,7 +133,7 @@ describe('Ride', () => {
       }
 
       effect(op) {
-        effects.push(op);
+        effects.push({ type: op.type, payload: op.payload });
       }
     }
 
@@ -214,7 +254,7 @@ describe('Ride', () => {
     });
   });
 
-  it.only('coalesces operations by key (last write wins)', async () => {
+  it('coalesces operations by key (last write wins)', async () => {
     class App extends Component {
       static async createHost() {
         return new MockHost();
@@ -234,11 +274,9 @@ describe('Ride', () => {
     }
 
     const app = Ride.mount(App, {});
-    await app.ready;
 
     await raf();
 
-    console.log(effects[0]);
     expect(effects.length).toBe(0);
 
     await raf();
