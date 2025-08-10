@@ -1,0 +1,21 @@
+{
+  "name": "@lockvoid/ride",
+  "version": "1.0.0",
+  "license": "MIT",
+  "author": "LockVoid",
+  "type": "module",
+  "engines": {
+    "node": "22.x",
+    "pnpm": "10.x"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@lockvoid/eslint-config": "^0.5.4",
+    "eslint": "^9.20.1",
+    "jsdom": "^26.1.0",
+    "vitest": "^3.2.4"
+  }
+}
