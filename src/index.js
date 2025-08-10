@@ -42,7 +42,7 @@ class CommandBuffer {
   get length() { return this.size; }
   nextGen() { this.generation++; }
 
-  push({ type, key, payload, priority = null, squash = null }) {
+  push({ type, key, payload, priority = null, squashWith = null }) {
     if (!type) throw new Error('op.type is required');
     if (!key) throw new Error('op.key is required (use Component.queue to compute it)');
 
@@ -64,8 +64,8 @@ class CommandBuffer {
     }
 
     const existingOp = this.ops[existingIndex];
-    const mergedPayload = squash
-      ? squash(existingOp.payload, payload, existingOp, newOp)
+    const mergedPayload = squashWith
+      ? squashWith(existingOp.payload, payload, existingOp, newOp)
       : payload;
 
     this.ops[existingIndex] = {
@@ -103,7 +103,7 @@ class CommandBuffer {
             key: lf.key,
             payload: lf.payload,
             priority: lf.priority ?? 0,
-            squash: null,
+            squashWith: null,
           });
         }
         return false;
@@ -391,12 +391,12 @@ export class Component {
   }
 
   queue(type, payload, opts = {}) {
-    const { key, coalesceBy = null, squash = null } = opts;
+    const { key, coalesceBy = null, squashWith = null } = opts;
     const opPriority = (opts.priority ?? 0);
     const priority = (this._componentPriority | 0) + (opPriority | 0); // component + op
     const coalesceKey = coalesceBy ? coalesceBy(type, payload) : (key ?? type);
 
-    this._cmds.push({ type, key: coalesceKey, payload, priority, squash });
+    this._cmds.push({ type, key: coalesceKey, payload, priority, squashWith });
 
     // Do not schedule RAF before ready; buffer stays inspectable for tests
     if (this.runtime.isReady) {
@@ -435,7 +435,7 @@ export class Component {
       key,
       payload: null,
       priority: (this._componentPriority | 0) - 1, // runs before any user op of this component
-      squash: (prev) => prev,
+      squashWith: (prev) => prev,
     });
     if (this.runtime.isReady) {
       this.runtime.scheduler.markDirty(this);

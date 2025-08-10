@@ -237,7 +237,7 @@ describe('Ride', () => {
     });
   });
 
-  it('coalesces operations by key (last write wins)', async () => {
+  it('coalesces operations by a key (last write wins)', async () => {
     let buffer;
 
     class App extends Component {
@@ -269,7 +269,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(buffer.length).toBe(1);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init' }]);
     expect(effects.length).toBe(0);
 
     // 2
@@ -279,7 +279,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(buffer.length).toBe(2);
-    expect(buffer.ops).toMatchObject([{ type: 'position'}, { type: 'velocity' }]);
+    expect(buffer.ops).toMatchObject([{ type: 'position' }, { type: 'velocity' }]);
     expect(effects.length).toBe(0);
 
     // 3
@@ -290,6 +290,164 @@ describe('Ride', () => {
     expect(buffer.ops).toStrictEqual([]);
     expect(effects.length).toBe(2);
     expect(effects).toMatchObject([{ type: 'position', payload: { x: 2, y: 2 } }, { type: 'velocity', payload: { v: 10 } } ]);
+  });
+
+  it('coalesces by operations an explicit key (last write wins)', async () => {
+    let buffer;
+
+    class App extends Component {
+      static progressive = { budget: Number.MAX_SAFE_INTEGER };
+      static async createHost() { return new MockHost(); }
+
+      async init() {
+        this.queue('position1', { x: 1, y: 1 }, { key: 'position' });
+        this.queue('position2', { x: 2, y: 2 }, { key: 'position' });
+
+        this.queue('velocity', { v: 10 }, { key: 'vel' });
+      }
+
+      effect(op) {
+        effects.push({ type: op.type, payload: op.payload });
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    // 1
+
+    await raf();
+
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(1);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}]);
+    expect(effects.length).toBe(0);
+
+    // 2
+
+    await raf();
+
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(2);
+    expect(buffer.ops).toMatchObject([{ type: 'position2' }, { type: 'velocity' }]);
+    expect(effects.length).toBe(0);
+
+    // 3
+
+    await raf();
+
+    expect(buffer.length).toBe(0);
+    expect(buffer.ops).toStrictEqual([]);
+    expect(effects.length).toBe(2);
+    expect(effects).toMatchObject([{ type: 'position2', payload: { x: 2, y: 2 } }, { type: 'velocity', payload: { v: 10 } } ]);
+  });
+
+  it('coalesces via coalesceBy and merges payloads via squashWith', async () => {
+    let buffer;
+
+    const coalesceById = (type, payload) => {
+      return `patch:${payload.id}`;
+    };
+
+    const squashWithMerge = (prevPayload, nextPayload) => {
+      const out = { ...prevPayload, ...nextPayload };
+
+      if (typeof prevPayload.dx === 'number' && typeof nextPayload.dx === 'number') {
+        out.dx = prevPayload.dx + nextPayload.dx;
+      }
+
+      if (typeof prevPayload.dy === 'number' && typeof nextPayload.dy === 'number') {
+        out.dy = prevPayload.dy + nextPayload.dy;
+      }
+      return out;
+    };
+
+    class App extends Component {
+      static progressive = { budget: Number.MAX_SAFE_INTEGER };
+
+      static async createHost() {
+        return new MockHost();
+      }
+
+      async init() {
+        this.queue('patch', { id: 1, dx: 1, dy: 0 }, { coalesceBy: coalesceById, squashWith: squashWithMerge });
+        this.queue('patch', { id: 1, dx: 2, dy: 3 }, { coalesceBy: coalesceById, squashWith: squashWithMerge });
+        this.queue('patch', { id: 1, dx: 4, dy: 1 }, { coalesceBy: coalesceById, squashWith: squashWithMerge });
+        this.queue('patch', { id: 2, dx: 5, dy: 5 }, { coalesceBy: coalesceById, squashWith: squashWithMerge });
+      }
+
+      effect(op) {
+        effects.push({ type: op.type, payload: op.payload });
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf();
+
+    // 1
+
+    await raf();
+
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(2);
+    expect(buffer.ops).toMatchObject([{ type: 'patch', key: 'patch:1' }, { type: 'patch', key: 'patch:2' }]);
+    expect(effects.length).toBe(0);
+
+    // 2
+
+    await raf();
+
+    expect(effects).toMatchObject([{ type: 'patch', payload: { id: 1, dx: 7, dy: 4 } }, { type: 'patch', payload: { id: 2, dx: 5, dy: 5 } }]);
+  });
+
+  it('coalescing keeps original sequence but updates priority (ordering stays consistent)', async () => {
+    let buffer;
+
+    class App extends Component {
+      static progressive = { budget: Number.MAX_SAFE_INTEGER };
+
+      static async createHost() {
+        return new MockHost();
+      }
+
+      async init() {
+        // A effects first with lower prio than B
+        this.queue('tick', { a: 1 }, { key: 'A', priority: 10 });
+
+        // B effects after with higher prio than A
+        this.queue('tick', { b: 1 }, { key: 'B', priority: 5 });
+
+        // A effects with priority 0 -> coalesces, keeps original sequence but now sorts before B
+        this.queue('tick', { a: 2 }, { key: 'A', priority: 0 });
+      }
+
+      effect(op) {
+        effects.push({ type: op.type, payload: op.payload });
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf();
+
+    // 1
+
+    await raf();
+
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(2);
+    expect(buffer.ops).toMatchObject([{ type: 'tick', key: 'A' }, { type: 'tick', key: 'B' }]);
+    expect(effects.length).toBe(0);
+
+    // 2
+
+    await raf();
+
+    expect(effects).toMatchObject([{ type: 'tick', payload: { a: 2 } }, { type: 'tick', payload: { b: 1 } }]);
   });
 
   it('schedules higher-priority siblings before lower-priority ones, slicing by frame budget', async () => {
