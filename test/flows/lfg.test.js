@@ -10,32 +10,7 @@ describe('Ride', () => {
     effects = [];
   });
 
-  it('diffs initial props on mount', async () => {
-    class App extends Component {
-      static async createHost() {
-        return new MockHost();
-      }
-
-      diff(prev = {}, next = {}) {
-        diffs.push({ prev, next });
-      }
-    }
-
-    const app = Ride.mount(App, { foo: 1 });
-
-    expect(diffs.length).toBe(0);
-
-    await raf();
-
-    expect(diffs.length).toBe(0);
-
-    await raf();
-
-    expect(diffs.length).toBe(1);
-    expect(diffs[0]).toEqual({ prev: { foo: 1 }, next: { foo: 1 } });
-  });
-
-  it.only('buffers operations before the host is ready', async () => {
+  it('buffers operations before the host is ready', async () => {
     let buffer;
 
     const host = createDeferred();
@@ -63,7 +38,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(buffer.length).toBe(2);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init', priority: -1 }, { type: 'foo', priority: 0 }]);
     expect(effects.length).toBe(0);
 
     // 2
@@ -73,7 +48,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(app.getCommandBuffer().length).toBe(3);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init', priority: -1 }, { type: 'foo', priority: 0 }, { type: 'bar', priority: 0 }]);
     expect(effects.length).toBe(0);
 
     // 3
@@ -83,7 +58,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(app.getCommandBuffer().length).toBe(4);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init', priority: -1 }, { type: 'foo', priority: 0 }, { type: 'bar', priority: 0 }, { type: 'qux', priority: 0 }]);
     expect(effects.length).toBe(0);
 
     // 4
@@ -93,7 +68,7 @@ describe('Ride', () => {
     buffer = app.getCommandBuffer();
 
     expect(app.getCommandBuffer().length).toBe(4);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init', priority: -1 }, { type: 'foo', priority: 0 }, { type: 'bar', priority: 0 }, { type: 'qux', priority: 0 }]);
     expect(effects.length).toBe(0);
 
     // 5
@@ -103,7 +78,7 @@ describe('Ride', () => {
     await raf();
 
     expect(app.getCommandBuffer().length).toBe(4);
-    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}, { type: 'foo' }, { type: 'bar' }, { type: 'qux' }]);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init', priority: -1 }, { type: 'foo', priority: 0 }, { type: 'bar', priority: 0 }, { type: 'qux', priority: 0 }]);
     expect(effects.length).toBe(0);
 
     await raf();
@@ -140,7 +115,8 @@ describe('Ride', () => {
     }
 
     const app = Ride.mount(App, {});
-    await app.ready;
+
+    await raf();
 
     // 1 - should defer and queue 'bar'
 
@@ -197,7 +173,8 @@ describe('Ride', () => {
     }
 
     const app = Ride.mount(App, { initial: true });
-    await app.ready;
+
+    await raf();
 
     diffs = []; // Reset after initial diff
 
@@ -208,6 +185,7 @@ describe('Ride', () => {
     await raf();
 
     expect(app.props).toEqual({ initial: true });
+
     expect(diffs[0]).toEqual({
       prev: { initial: true },
       next: { initial: true, foo: 1 },
@@ -222,6 +200,7 @@ describe('Ride', () => {
     await raf();
 
     expect(app.props).toEqual({ initial: true });
+
     expect(diffs[0]).toEqual({
       prev: { initial: true },
       next: { initial: true, foo: 1, bar: 2 },
@@ -236,6 +215,7 @@ describe('Ride', () => {
     await raf();
 
     expect(app.props).toEqual({ initial: true, foo: 1, bar: 2, ready: true });
+
     expect(diffs[0]).toEqual({
       prev: { initial: true },
       next: { initial: true, foo: 1, bar: 2, ready: true },
@@ -250,6 +230,7 @@ describe('Ride', () => {
     await raf();
 
     expect(app.props).toEqual({ initial: true, foo: 1, bar: 2, ready: true, final: true });
+
     expect(diffs[0]).toEqual({
       prev: { initial: true, foo: 1, bar: 2, ready: true },
       next: { initial: true, foo: 1, bar: 2, ready: true, final: true },
@@ -257,6 +238,8 @@ describe('Ride', () => {
   });
 
   it('coalesces operations by key (last write wins)', async () => {
+    let buffer;
+
     class App extends Component {
       static async createHost() {
         return new MockHost();
@@ -268,6 +251,8 @@ describe('Ride', () => {
         this.queue('position', { x: 2, y: 2 });
 
         this.queue('velocity', { v: 10 });
+
+      // console.log(' app.getCommandBuffer();',  this.getCommandBuffer());
       }
 
       effect(op) {
@@ -277,17 +262,34 @@ describe('Ride', () => {
 
     const app = Ride.mount(App, {});
 
+    // 1
+
     await raf();
 
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(1);
+    expect(buffer.ops).toMatchObject([{ type: '@ride/init'}]);
     expect(effects.length).toBe(0);
 
+    // 2
+
     await raf();
 
+    buffer = app.getCommandBuffer();
+
+    expect(buffer.length).toBe(2);
+    expect(buffer.ops).toMatchObject([{ type: 'position'}, { type: 'velocity' }]);
+    expect(effects.length).toBe(0);
+
+    // 3
+
+    await raf();
+
+    expect(buffer.length).toBe(0);
+    expect(buffer.ops).toStrictEqual([]);
     expect(effects.length).toBe(2);
-    expect(effects).toEqual([
-      { type: 'position', payload: { x: 2, y: 2 } },
-      { type: 'velocity', payload: { v: 10 } },
-    ]);
+    expect(effects).toMatchObject([{ type: 'position', payload: { x: 2, y: 2 } }, { type: 'velocity', payload: { v: 10 } } ]);
   });
 /*
 

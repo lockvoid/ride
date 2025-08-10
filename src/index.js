@@ -75,48 +75,46 @@ class CommandBuffer {
    * Budget-aware drain: calls effect(op) until shouldYield() is true.
    * Returns true if fully drained, false if yielded with leftovers re-queued.
    */
-  async drain(effect, shouldYield) {
-    const prioritized = [];
-    const unprioritized = [];
+   async drain(effect, shouldYield) {
+     // Snapshot current ops (so anything queued during effect() runs next RAF)
+     const snapshot = this.ops.slice();
 
-    for (const op of this.ops) {
-      if (!op) continue;
-      (op.priority == null ? unprioritized : prioritized).push(op);
-    }
+     // Sort: 0 = highest; ties by insertion sequence for stability
+     snapshot.sort((a, b) => {
+       const pa = (a.priority ?? 0);
+       const pb = (b.priority ?? 0);
+       return (pa - pb) || (a.sequence - b.sequence);
+     });
 
-    // 0 = highest, larger = lower; tie-break by insertion sequence (stable)
-    prioritized.sort((a, b) =>
-      (a.priority - b.priority) || (a.sequence - b.sequence),
-    );
+     // Clear live buffer; new ops (queued during effect) will land here
+     this.ops.length = 0;
+     this.index.clear();
+     this.size = 0;
 
-    // clear; rebuild if we yield
-    this.ops.length = 0;
-    this.index.clear();
+     for (let i = 0; i < snapshot.length; i++) {
+       // If we must yield, requeue the remaining *snapshot* ops using push()
+       if (shouldYield()) {
+         for (let j = i; j < snapshot.length; j++) {
+           const lf = snapshot[j];
+           this.push({
+             type: lf.type,
+             key: lf.key,
+             payload: lf.payload,
+             priority: lf.priority ?? 0,
+             squash: null,
+           });
+         }
+         // size already updated by push()
+         return false; // not fully drained
+       }
 
-    const queues = [prioritized, unprioritized];
+       await effect(snapshot[i]);
+     }
 
-    for (let qi = 0; qi < queues.length; qi++) {
-      const queue = queues[qi];
-      for (let i = 0; i < queue.length; i++) {
-        const op = queue[i];
-        if (shouldYield()) {
-          const remaining = queue.slice(i);
-          const tail = queues.slice(qi + 1);
-          const leftover = remaining.concat(...tail);
-          for (const lf of leftover) {
-            this.index.set(lf.key, this.ops.length);
-            this.ops.push(lf);
-          }
-          this.size = this.ops.length;
-          return false;
-        }
-        await effect(op);
-      }
-    }
-
-    this.size = 0;
-    return true;
-  }
+     // Fully drained the snapshot; leave any newly queued ops for next RAF
+     this.size = this.ops.length;
+     return true;
+   }
 }
 
 /* ============================================================================
@@ -180,13 +178,8 @@ class Scheduler {
         if (shouldYield()) { this.dirty.add(component); break; }
         await component._runInitialDiff();
 
-        // try to drain ops queued by initial diff in the same frame
-        if (component._cmds.size > 0 && !shouldYield()) {
-          const drained2 = await component._cmds.drain(
-            component._effect.bind(component),
-            shouldYield,
-          );
-          if (!drained2) this.dirty.add(component);
+        if (component._cmds.size > 0) {
+          this.dirty.add(component);
         }
       }
 
@@ -382,7 +375,7 @@ export class Component {
 
   queue(type, payload, opts = {}) {
     const { key, coalesceBy = null, squash = null } = opts;
-    const priority = (opts.priority ?? this._defaultPriority);
+    const priority = (opts.priority ?? 0);
     const coalesceKey = coalesceBy ? coalesceBy(type, payload) : (key ?? type);
 
     this._cmds.push({ type, key: coalesceKey, payload, priority, squash });
@@ -423,7 +416,7 @@ export class Component {
       type: '@ride/init',
       key,
       payload: null,
-      priority: this._defaultPriority ?? PRIORITY.HIGHEST,
+      priority: -1,
       squash: (prev) => prev,
     });
     // Do NOT schedule RAF before ready.
