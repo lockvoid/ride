@@ -17,5 +17,11 @@
     "eslint": "^9.20.1",
     "jsdom": "^26.1.0",
     "vitest": "^3.2.4"
+  },
+  "exports": {
+    ".": {
+      "default": "./src/index.js",
+      "types": "./types/index.d.mts"
+    }
   }
 }
