@@ -64,21 +64,42 @@ class Host {
     this.rootNode = { id: 'root', kind: 'scene', children: [], props: {} };
     this.nodes.set('root', this.rootNode);
 
-    // sprite pipeline
+    // sprite pipeline with rotation and anchor support
     const quad = [ 0,0, 1,0, 0,1,  0,1, 1,0, 1,1 ];
     const vert = `
       precision mediump float;
       attribute vec2 position;      // 0..1
-      uniform vec2 uTranslatePx;    // device px
-      uniform vec2 uScalePx;        // device px
+      uniform vec2 uTranslatePx;    // device px (position)
+      uniform vec2 uScalePx;        // device px (size)
+      uniform vec2 uAnchor;         // 0..1 (normalized anchor point)
+      uniform float uRotation;      // radians
       uniform vec2 uViewport;       // device px
       varying vec2 vUV;
+
       void main() {
-        vec2 xy = position * uScalePx + uTranslatePx;
+        // Apply anchor offset (in normalized space 0..1)
+        vec2 anchoredPos = position - uAnchor;
+
+        // Scale to actual size
+        vec2 scaledPos = anchoredPos * uScalePx;
+
+        // Apply rotation around the anchor point (which is now at origin)
+        float cosR = cos(uRotation);
+        float sinR = sin(uRotation);
+        vec2 rotatedPos = vec2(
+          scaledPos.x * cosR - scaledPos.y * sinR,
+          scaledPos.x * sinR + scaledPos.y * cosR
+        );
+
+        // Translate to final position (anchor point moves to uTranslatePx)
+        vec2 xy = rotatedPos + uTranslatePx;
+
+        // Convert to clip space
         vec2 clip = vec2(
           (xy.x / uViewport.x) * 2.0 - 1.0,
           1.0 - (xy.y / uViewport.y) * 2.0
         );
+
         vUV = position;
         gl_Position = vec4(clip, 0.0, 1.0);
       }
@@ -101,6 +122,8 @@ class Host {
       uniforms: {
         uTranslatePx: this.regl.prop('uTranslatePx'),
         uScalePx: this.regl.prop('uScalePx'),
+        uAnchor: this.regl.prop('uAnchor'),
+        uRotation: this.regl.prop('uRotation'),
         uViewport: viewport,
         uTex: this.regl.prop('uTex'),
         uAlpha: this.regl.prop('uAlpha'),
@@ -212,10 +235,43 @@ class Host {
     };
     const clamp = (v) => Math.max(0, Math.round(v));
 
-    const visit = (node, absX, absY, parentAlpha, parentScissorCss) => {
+    // Helper to convert degrees to radians if needed
+    const toRadians = (angle, unit = 'radians') => {
+      if (unit === 'degrees' || unit === 'deg') return angle * Math.PI / 180;
+      return angle;
+    };
+
+    const visit = (node, absX, absY, parentAlpha, parentScissorCss, parentRotation = 0) => {
       const p = node.props || {};
-      const x = (p.x || 0) + absX;
-      const y = (p.y || 0) + absY;
+
+      // Get anchor point (defaults to top-left: 0,0)
+      const [anchorX, anchorY] = p.anchor || [0, 0];
+
+      // Get rotation (can be in degrees or radians)
+      const localRotation = p.rotation ?? 0;
+      const rotationUnit = p.rotationUnit ?? 'radians';
+      const rotation = toRadians(localRotation, rotationUnit);
+
+      // Accumulate rotation through the scene graph
+      const totalRotation = parentRotation + rotation;
+
+      // Calculate position considering parent transform
+      let x = (p.x || 0);
+      let y = (p.y || 0);
+
+      // If parent has rotation, rotate this node's position around parent's origin
+      if (parentRotation !== 0) {
+        const cos = Math.cos(parentRotation);
+        const sin = Math.sin(parentRotation);
+        const rotX = x * cos - y * sin;
+        const rotY = x * sin + y * cos;
+        x = rotX;
+        y = rotY;
+      }
+
+      x += absX;
+      y += absY;
+
       const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
 
       const localScissorCss = p.scissor ? offsetRect(p.scissor, x, y) : null;
@@ -224,6 +280,8 @@ class Host {
       if (node.kind === 'sprite' && node.texture) {
         const wCss = p.width  != null ? p.width  : (node.texSize ? node.texSize[0] / dprX : 0);
         const hCss = p.height != null ? p.height : (node.texSize ? node.texSize[1] / dprY : 0);
+
+        // Convert position and size to device pixels
         const [tx, ty, tw, th] = toDevice(x, y, wCss, hCss);
 
         let scissorEnabled = false;
@@ -237,9 +295,12 @@ class Host {
           if (sw > 0 && sh > 0) { scissorEnabled = true; scissorBox = { x: sx, y: sy, width: sw, height: sh }; }
         }
 
+        console.log('[anchorX, anchorY]', [anchorX, anchorY])
         this.drawSprite({
           uTranslatePx: [tx, ty],
           uScalePx: [tw, th],
+          uAnchor: [anchorX, anchorY],
+          uRotation: totalRotation,
           uTex: node.texture,
           uAlpha: a,
           scissorEnabled,
@@ -247,12 +308,15 @@ class Host {
         });
       }
 
-      for (const child of node.children) visit(child, x, y, a, mergedScissorCss);
+      // Visit children with accumulated transform
+      for (const child of node.children) {
+        visit(child, x, y, a, mergedScissorCss, totalRotation);
+      }
     };
 
     this.regl.poll();
     this.regl.clear({ color: [0.07, 0.08, 0.1, 1], depth: 1 });
-    visit(this.rootNode, 0, 0, 1, null);
+    visit(this.rootNode, 0, 0, 1, null, 0);
   }
 
   // simple, immediate resize: update CSS + backing store, then redraw NOW
