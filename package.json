@@ -20,8 +20,8 @@
   },
   "exports": {
     ".": {
-      "default": "./src/index.js",
-      "types": "./types/index.d.mts"
+      "types": "./types/index.d.mts",
+      "default": "./src/index.js"
     }
   }
 }

@@ -241,7 +241,7 @@ class Runtime {
  * ==========================================================================*/
 
 export class Component {
-  constructor(props, runtime, parent = null) {
+  constructor(props, context, runtime, parent = null) {
     // Refs
     this.runtime = runtime;
     this.parent = parent;
@@ -251,6 +251,9 @@ export class Component {
     this.props = props || {};
     this._stagedProps = null;
     this.prevProps = undefined;
+
+    // Context
+    this.context = context || {};
 
     // Internals
     this._children = new Set();
@@ -405,7 +408,7 @@ export class Component {
   }
 
   mount(ChildClass, props) {
-    const child = new ChildClass(props, this.runtime, this);
+    const child = new ChildClass(props, this.context, this.runtime, this);
     this._children.add(child);
     return child;
   }
@@ -459,22 +462,22 @@ export class Ride {
   static _seq = 0;
   static _nextSeq() { return ++this._seq; }
 
-  static mount(AppClass, props) {
+  static mount(AppClass, props = {}, context = {}) {
     const frameBudgetMs = AppClass?.progressive?.budget ?? 8;
     const scheduler = new Scheduler({ frameBudgetMs });
     const runtime = new Runtime(scheduler);
 
-    const app = new AppClass(props, runtime, null); // immediate
+    const app = new AppClass(props, context, runtime, null); // immediate
 
     // Boot host asynchronously
-    this._bootHost(AppClass, props, runtime, scheduler, app);
+    this._bootHost(AppClass, props, context, runtime, scheduler, app);
 
     return app;
   }
 
-  static async _bootHost(AppClass, props, runtime, scheduler, app) {
+  static async _bootHost(AppClass, props, context, runtime, scheduler, app) {
     try {
-      const host = await AppClass.createHost?.(props); // may be deferred
+      const host = await AppClass.createHost?.(props, context); // may be deferred
       if (host) {
         host.isReady = true;
         runtime._resolveReady(host);

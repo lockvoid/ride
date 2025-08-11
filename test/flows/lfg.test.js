@@ -573,4 +573,32 @@ describe('Ride', () => {
       { type: 'render', who: 'ItemPicture 2' },
     ]);
   });
+
+  it('has context', async () => {
+    let child;
+
+    class Parent extends Component {
+      static async createHost() {
+        return new MockHost();
+      }
+
+      async init() {
+        child = this.mount(Child);
+      }
+    }
+
+    class Child extends Component {
+    }
+
+    const parent = Ride.mount(Parent, {}, { foo: 'bar' });
+
+    await raf();
+
+    // 1
+
+    await raf();
+
+    expect(parent.context).toEqual({ foo: 'bar' });
+    expect(child.context).toEqual({ foo: 'bar' });
+  });
 });
