@@ -1,22 +1,16 @@
 // packages/ride-regl/Host.js
 import createREGL from 'regl';
 
-const clampPosInt = (v) => Math.max(0, Math.round(v));
-
 class Host {
-  /**
-   * @param {{canvas: HTMLCanvasElement, resizePolicy?: 'instant'|'deferredFrame', settleFrames?: number}} opts
-   */
-  constructor({ canvas, resizePolicy = 'deferredFrame', settleFrames = 2 }) {
-    // DOM / GL
+  constructor({ canvas }) {
     this.canvas = canvas;
     this.regl = null;
 
     // scene graph
-    this.rootNode = null; // { id, kind, children, props, texture, texSize, _lastSource }
+    this.rootNode = null;   // { id, kind, children, props, texture, texSize, _lastSource }
     this.nodes = new Map();
 
-    // draw scheduling
+    // draw scheduling (used by Ride)
     this._raf = 0;
     this._needs = false;
 
@@ -26,15 +20,8 @@ class Host {
     // resize plumbing
     this._container = null;
     this._ro = null;
-    this._dprHandle = null;
-    this._lastDpr = 1;
-    this._resizeLoopId = null;
-    this._resizePolicy = resizePolicy;     // 'instant' | 'deferredFrame'
-    this._settleFrames = settleFrames | 0; // stable RAF count before commit
-    this._stableLeft = 0;
     this._lastCss = { w: 0, h: 0 };
-    this._wantDev = { w: 0, h: 0, dpr: 1 };
-    this._externalSize = null; // { width?, height?, dpr? } for setSize(...)
+    this._lastDev = { w: 0, h: 0, dpr: 1 };
 
     // context lost/restore
     this._ctxLost = false;
@@ -42,44 +29,31 @@ class Host {
     this._onCtxRestored = null;
   }
 
-  // ---------- one-liner for Ride.createHost ----------
-  /**
-   * @param {{container?:HTMLElement,width?:number,height?:number,dpr?:number,autoResize?:boolean|{policy?:'instant'|'deferredFrame',settleFrames?:number}}} cfg
-   */
+  // one-liner for Ride.createHost
   static async create({ container = document.body, width, height, dpr, autoResize = true } = {}) {
     const canvas = document.createElement('canvas');
     canvas.className = 'ride-regl-canvas';
     container.appendChild(canvas);
 
-    // normalize autoResize
-    let policy = 'deferredFrame';
-    let settleFrames = 2;
-    if (autoResize && typeof autoResize === 'object') {
-      if (autoResize.policy) policy = autoResize.policy;
-      if (Number.isFinite(autoResize.settleFrames)) settleFrames = autoResize.settleFrames | 0;
-    } else if (autoResize === false) {
-      policy = 'instant'; // we won't install observers below
-    }
-
-    const host = new Host({ canvas, resizePolicy: policy, settleFrames });
+    const host = new Host({ canvas });
     await host.init();
 
     host._container = container;
-    host._externalSize = { width, height, dpr };
 
-    // 1) First-time sizing: commit immediately so backbuffer isn't tiny/zero.
-    host._measureAndApplyCssSize(true);
-    host._updateDesiredDeviceSize(true);
-    host._commitDeviceSize();   // <-- ensure real backbuffer now
-    host.requestRender();
+    // initial size (commit immediately and draw now)
+    host._applySize({
+      cssW: Math.max(1, Math.floor(width ?? container.clientWidth ?? 1)),
+      cssH: Math.max(1, Math.floor(height ?? container.clientHeight ?? 1)),
+      dpr:  (dpr ?? window.devicePixelRatio ?? 1),
+      commit: true,
+      redrawNow: true,
+    });
 
-    // 2) Then enable autoresize (frame-settle) if requested
-    if (autoResize) host._installAutoResize(container);
+    if (autoResize) host._installAutoResize();
 
     return host;
   }
 
-  // ---------- lifecycle ----------
   async init() {
     this.regl = createREGL({
       canvas: this.canvas,
@@ -90,13 +64,11 @@ class Host {
     this.rootNode = { id: 'root', kind: 'scene', children: [], props: {} };
     this.nodes.set('root', this.rootNode);
 
-    // geom
+    // sprite pipeline
     const quad = [ 0,0, 1,0, 0,1,  0,1, 1,0, 1,1 ];
-
-    // shaders
     const vert = `
       precision mediump float;
-      attribute vec2 position;      // 0..1 quad
+      attribute vec2 position;      // 0..1
       uniform vec2 uTranslatePx;    // device px
       uniform vec2 uScalePx;        // device px
       uniform vec2 uViewport;       // device px
@@ -149,9 +121,9 @@ class Host {
       this.nodes.forEach(n => { if (n.texture) { try { n.texture.destroy(); } catch {} n.texture = null; } });
       // re-init pipeline
       this.init().then(() => {
-        // re-upload from cached sources if present
         this.nodes.forEach(n => { if (n._lastSource) this.setTexture(n, n._lastSource); });
-        this.requestRender();
+        // redraw immediately at current size
+        this._applySize({ commit: true, redrawNow: true });
       });
     };
     this.canvas.addEventListener('webglcontextlost', this._onCtxLost, false);
@@ -161,8 +133,6 @@ class Host {
   teardown() {
     cancelAnimationFrame(this._raf);
     if (this._ro) { this._ro.disconnect(); this._ro = null; }
-    if (this._dprHandle) cancelAnimationFrame(this._dprHandle);
-    if (this._resizeLoopId) cancelAnimationFrame(this._resizeLoopId);
     this.canvas.removeEventListener('webglcontextlost', this._onCtxLost, false);
     this.canvas.removeEventListener('webglcontextrestored', this._onCtxRestored, false);
     for (const n of this.nodes.values()) n.texture && n.texture.destroy && n.texture.destroy();
@@ -170,7 +140,7 @@ class Host {
     if (this.regl) this.regl.destroy();
   }
 
-  // ---------- scene graph ----------
+  // scene graph
   createNode(_component, kind = 'scene') {
     const id = `${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 7)}`;
     const node = { id, kind, parent: undefined, children: [], props: {}, texture: null, texSize: null, _lastSource: null };
@@ -194,12 +164,11 @@ class Host {
   }
 
   setProps(node, patch) { Object.assign(node.props, patch); }
-
   setTexture(node, source) {
     if (!this.regl) return;
     if (node.texture) node.texture.destroy();
     node.texture = this.regl.texture(source);
-    node._lastSource = source; // for context-restore
+    node._lastSource = source;
 
     let w = 0, h = 0;
     if (source instanceof HTMLCanvasElement) { w = source.width; h = source.height; }
@@ -208,7 +177,7 @@ class Host {
     node.texSize = [w, h];
   }
 
-  // ---------- render ----------
+  // drawing
   requestRender() {
     if (this._needs || this._ctxLost) return;
     this._needs = true;
@@ -223,8 +192,8 @@ class Host {
 
     const canvasW = Math.max(1, this.canvas.width);
     const canvasH = Math.max(1, this.canvas.height);
-    const cssW = Math.max(1, this.canvas.clientWidth || canvasW);
-    const cssH = Math.max(1, this.canvas.clientHeight || canvasH);
+    const cssW = Math.max(1, this._lastCss.w || this.canvas.clientWidth || canvasW);
+    const cssH = Math.max(1, this._lastCss.h || this.canvas.clientHeight || canvasH);
     const dprX = canvasW / cssW;
     const dprY = canvasH / cssH;
 
@@ -239,8 +208,9 @@ class Host {
       const B = Math.min(a[1] + a[3], b[1] + b[3]);
       const w = Math.max(0, R - x);
       const h = Math.max(0, B - y);
-      return w > 0 && h > 0 ? [x, y, w, h] : null;
+      return (w > 0 && h > 0) ? [x, y, w, h] : null;
     };
+    const clamp = (v) => Math.max(0, Math.round(v));
 
     const visit = (node, absX, absY, parentAlpha, parentScissorCss) => {
       const p = node.props || {};
@@ -248,28 +218,23 @@ class Host {
       const y = (p.y || 0) + absY;
       const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
 
-      // scissor: local CSS rect (x,y,w,h) → absolute CSS; then intersect
       const localScissorCss = p.scissor ? offsetRect(p.scissor, x, y) : null;
       const mergedScissorCss = intersect(parentScissorCss, localScissorCss);
 
       if (node.kind === 'sprite' && node.texture) {
-        const wCss = p.width != null ? p.width : (node.texSize ? node.texSize[0] / dprX : 0);
+        const wCss = p.width  != null ? p.width  : (node.texSize ? node.texSize[0] / dprX : 0);
         const hCss = p.height != null ? p.height : (node.texSize ? node.texSize[1] / dprY : 0);
-
         const [tx, ty, tw, th] = toDevice(x, y, wCss, hCss);
 
         let scissorEnabled = false;
         let scissorBox = { x: 0, y: 0, width: 0, height: 0 };
         if (mergedScissorCss) {
           let [sx, sy, sw, sh] = toDevice(...mergedScissorCss);
-          sx = clampPosInt(sx);
-          sy = clampPosInt(canvasH - (sy + sh)); // GL is bottom-left
-          sw = clampPosInt(sw);
-          sh = clampPosInt(sh);
-          if (sw > 0 && sh > 0) {
-            scissorEnabled = true;
-            scissorBox = { x: sx, y: sy, width: sw, height: sh };
-          }
+          sx = clamp(sx);
+          sy = clamp(canvasH - (sy + sh)); // GL bottom-left
+          sw = clamp(sw);
+          sh = clamp(sh);
+          if (sw > 0 && sh > 0) { scissorEnabled = true; scissorBox = { x: sx, y: sy, width: sw, height: sh }; }
         }
 
         this.drawSprite({
@@ -290,91 +255,44 @@ class Host {
     visit(this.rootNode, 0, 0, 1, null);
   }
 
-  // ---------- autoresize (frame-settle) ----------
-  _installAutoResize(container) {
-    this._container = container;
-
-    // CSS size changes
-    this._ro = new ResizeObserver(() => this._onResizeSignal());
-    this._ro.observe(container);
-
-    // DPR changes
-    const dprTick = () => {
-      const d = window.devicePixelRatio || 1;
-      if (Math.abs(d - this._lastDpr) > 1e-3) this._onResizeSignal();
-      this._dprHandle = requestAnimationFrame(dprTick);
-    };
-    this._lastDpr = window.devicePixelRatio || 1;
-    this._dprHandle = requestAnimationFrame(dprTick);
-  }
-
-  setSize({ width, height, dpr } = {}) {
-    this._externalSize = { width, height, dpr };
-    this._onResizeSignal(true);
-  }
-
-  _onResizeSignal(force = false) {
-    this._measureAndApplyCssSize(force);
-    this._updateDesiredDeviceSize(force);
-
-    if (this._resizePolicy === 'instant') {
-      this._commitDeviceSize();
-      return;
-    }
-
-    if (!this._resizeLoopId) {
-      const loop = () => {
-        // keep reading & stabilizing
-        this._measureAndApplyCssSize(false);
-        const changed = this._updateDesiredDeviceSize(false);
-
-        if (this._stableLeft <= 0) {
-          this._commitDeviceSize();
-          this._resizeLoopId = null;
-          return;
-        }
-
-        // if size keeps changing, reset settle counter inside _updateDesiredDeviceSize
-        this._stableLeft -= 1;
-        this._resizeLoopId = requestAnimationFrame(loop);
-      };
-      this._resizeLoopId = requestAnimationFrame(loop);
-    }
-  }
-
-  _measureAndApplyCssSize(force) {
+  // simple, immediate resize: update CSS + backing store, then redraw NOW
+  _applySize({ cssW, cssH, dpr, commit = true, redrawNow = true } = {}) {
     const container = this._container || this.canvas.parentElement || document.body;
-    const cssW = Math.max(1, Math.floor(this._externalSize?.width  ?? container.clientWidth  ?? 1));
-    const cssH = Math.max(1, Math.floor(this._externalSize?.height ?? container.clientHeight ?? 1));
+    const wCss = Math.max(1, cssW ?? container.clientWidth ?? 1);
+    const hCss = Math.max(1, cssH ?? container.clientHeight ?? 1);
+    const DPR  = Math.max(1, dpr ?? window.devicePixelRatio ?? 1);
+    const wDev = Math.max(1, Math.floor(wCss * DPR));
+    const hDev = Math.max(1, Math.floor(hCss * DPR));
 
-    if (force || this._lastCss.w !== cssW || this._lastCss.h !== cssH) {
-      this.canvas.style.width = cssW + 'px';
-      this.canvas.style.height = cssH + 'px';
-      this._lastCss = { w: cssW, h: cssH };
+    // CSS size first (no blink)
+    if (this._lastCss.w !== wCss || this._lastCss.h !== hCss) {
+      this.canvas.style.width = wCss + 'px';
+      this.canvas.style.height = hCss + 'px';
+      this._lastCss = { w: wCss, h: hCss };
     }
+
+    if (commit && (this._lastDev.w !== wDev || this._lastDev.h !== hDev || this._lastDev.dpr !== DPR)) {
+      this.canvas.width  = wDev;
+      this.canvas.height = hDev;
+      this._lastDev = { w: wDev, h: hDev, dpr: DPR };
+    }
+
+    if (redrawNow) this.frame(); // draw synchronously in the same frame
   }
 
-  _updateDesiredDeviceSize(force) {
-    const dpr = (this._externalSize?.dpr ?? (window.devicePixelRatio || 1)) || 1;
-    const wantW = Math.max(1, Math.floor(this._lastCss.w * dpr));
-    const wantH = Math.max(1, Math.floor(this._lastCss.h * dpr));
-    const changed = (this._wantDev.w !== wantW) || (this._wantDev.h !== wantH) || (this._wantDev.dpr !== dpr);
+  _installAutoResize() {
+    const onRO = () => {
+      this._applySize({ commit: true, redrawNow: true });
+    };
+    this._ro = new ResizeObserver(onRO);
+    this._ro.observe(this._container);
 
-    if (changed || force) {
-      this._wantDev = { w: wantW, h: wantH, dpr };
-      this._stableLeft = this._settleFrames;
-    }
-    return changed;
-  }
+    // handle DPR change (often also triggers RO, but this covers edge cases)
+    const onWindowResize = () => this._applySize({ commit: true, redrawNow: true });
+    window.addEventListener('resize', onWindowResize);
 
-  _commitDeviceSize() {
-    const { w, h, dpr } = this._wantDev;
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-      this._lastDpr = dpr;
-      this.requestRender(); // repaint once at the new resolution
-    }
+    // keep a reference so teardown can remove it
+    this._removeWinResize = () => window.removeEventListener('resize', onWindowResize);
   }
 }
 

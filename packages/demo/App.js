@@ -20,7 +20,7 @@ class App extends Component {
   static progressive = { budget: 8 };
 
   static async createHost(props) {
-    return Host.create({ container: props.container,     autoResize: { policy: 'deferredFrame', settleFrames: 2 } });
+    return Host.create({ container: props.container,  autoResize: { policy: 'live' } });
   }
 
   async init() {
