@@ -20,23 +20,7 @@ class App extends Component {
   static progressive = { budget: 8 };
 
   static async createHost(props) {
-    const { container = document.body } = props;
-    const canvas = document.createElement('canvas');
-    canvas.className = 'ride-regl-canvas';
-    container.appendChild(canvas);
-
-    const resize = () => fitCanvasTo(container, canvas);
-    resize();
-    window.addEventListener('resize', resize);
-
-    const host = new Host({ canvas });
-    await host.init();
-
-    // preserve resize cleanup
-    const origTeardown = host.teardown.bind(host);
-    host.teardown = () => { window.removeEventListener('resize', resize); origTeardown(); };
-
-    return host;
+    return Host.create({ container: props.container,     autoResize: { policy: 'deferredFrame', settleFrames: 2 } });
   }
 
   async init() {
