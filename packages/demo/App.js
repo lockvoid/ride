@@ -25,8 +25,8 @@ class App extends Component {
 
   async init() {
     const scene = this.mount(Scene, {
-      x: 0,
-      y: 0,
+      x: 200,
+      y: 200,
       alpha: 1,
     //  scissor: [0, 0, 200, 200],
       //rotation: 12,
@@ -35,11 +35,24 @@ class App extends Component {
       height: 400
     });
 
+    const scene2 = scene.mount(Scene, {
+      x: 0,
+      y: 0,
+      alpha: 1,
+    //  scissor: [0, 0, 200, 200],
+      //rotation: 12,
+      anchor: [0, 0],
+      width: 400,
+      height: 400
+    });
+
+
+
     const bmp = await loadImageBitmap('/grid.png');
     console.log('[demo] imageBitmap', bmp.width, bmp.height); // should log real size
 
     // ⬇️ mount INTO the scene, not the app
-    const sprite = scene.mount(Sprite, {
+    const sprite = scene2.mount(Sprite, {
       x: 0, y: 0, width: 400, height: 400, alpha: 1, source: bmp,anchor: [0,0],
     });
 
@@ -50,7 +63,7 @@ class App extends Component {
     let rotation = 0;
     let i = 0;
     const rotate = () => {
-      //sprite.update({ rotation: rotation += 0.01 });
+      scene.update({ rotation: rotation += 0.01 });
 
       requestAnimationFrame(rotate)
     };

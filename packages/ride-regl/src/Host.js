@@ -243,63 +243,77 @@ class Host {
 
     const visit = (node, absX, absY, parentAlpha, parentScissorCss, parentRotation = 0) => {
       const p = node.props || {};
-
-      // Get anchor point (defaults to top-left: 0,0)
       const [anchorX, anchorY] = p.anchor || [0, 0];
 
-      // Get rotation (can be in degrees or radians)
+      // rotation: support deg or rad
       const localRotation = p.rotation ?? 0;
       const rotationUnit = p.rotationUnit ?? 'radians';
       const rotation = toRadians(localRotation, rotationUnit);
 
-      // Accumulate rotation through the scene graph
+      // total rotation down the tree
       const totalRotation = parentRotation + rotation;
 
-      // Calculate position considering parent transform
-      let x = (p.x || 0);
-      let y = (p.y || 0);
-
-      // If parent has rotation, rotate this node's position around parent's origin
+      // local translation (apply parent's rotation to our x,y)
+      let lx = p.x || 0, ly = p.y || 0;
       if (parentRotation !== 0) {
-        const cos = Math.cos(parentRotation);
-        const sin = Math.sin(parentRotation);
-        const rotX = x * cos - y * sin;
-        const rotY = x * sin + y * cos;
-        x = rotX;
-        y = rotY;
+        const c = Math.cos(parentRotation), s = Math.sin(parentRotation);
+        const rx = lx * c - ly * s;
+        const ry = lx * s + ly * c;
+        lx = rx; ly = ry;
       }
 
-      x += absX;
-      y += absY;
+      // PIVOT = where this node's anchor should land in world space
+      const pivotX = absX + lx;
+      const pivotY = absY + ly;
+
+      // ORIGIN = top-left for children (container-only). For sprites we keep pivot and let shader anchor.
+      let originX = pivotX, originY = pivotY;
+
+      // IMPORTANT: Only containers (non-sprites) shift their origin by -anchor*size
+      if (node.kind !== 'sprite') {
+        const wCss = p.width  ?? 0;
+        const hCss = p.height ?? 0;
+        let offX = -anchorX * wCss;
+        let offY = -anchorY * hCss;
+        if (totalRotation !== 0) {
+          const c = Math.cos(totalRotation), s = Math.sin(totalRotation);
+          const rx = offX * c - offY * s;
+          const ry = offX * s + offY * c;
+          offX = rx; offY = ry;
+        }
+        originX = pivotX + offX;
+        originY = pivotY + offY;
+      }
 
       const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
 
-      const localScissorCss = p.scissor ? offsetRect(p.scissor, x, y) : null;
+      // Scissor (axis-aligned). When rotated, this is a best-effort box.
+      let localScissorCss = null;
+      if (p.scissor) {
+        localScissorCss = offsetRect(p.scissor, originX, originY);
+      }
       const mergedScissorCss = intersect(parentScissorCss, localScissorCss);
 
+      // SPRITE draw: pass PIVOT as translation; shader handles sprite anchor
       if (node.kind === 'sprite' && node.texture) {
         const wCss = p.width  != null ? p.width  : (node.texSize ? node.texSize[0] / dprX : 0);
         const hCss = p.height != null ? p.height : (node.texSize ? node.texSize[1] / dprY : 0);
+        const [tx, ty, tw, th] = toDevice(pivotX, pivotY, wCss, hCss);
 
-        // Convert position and size to device pixels
-        const [tx, ty, tw, th] = toDevice(x, y, wCss, hCss);
-
-        let scissorEnabled = false;
-        let scissorBox = { x: 0, y: 0, width: 0, height: 0 };
+        let scissorEnabled = false, scissorBox = { x: 0, y: 0, width: 0, height: 0 };
         if (mergedScissorCss) {
           let [sx, sy, sw, sh] = toDevice(...mergedScissorCss);
           sx = clamp(sx);
-          sy = clamp(canvasH - (sy + sh)); // GL bottom-left
+          sy = clamp(canvasH - (sy + sh));
           sw = clamp(sw);
           sh = clamp(sh);
-          if (sw > 0 && sh > 0) { scissorEnabled = true; scissorBox = { x: sx, y: sy, width: sw, height: sh }; }
+          if (sw > 0 && sh > 0) scissorEnabled = true, scissorBox = { x: sx, y: sy, width: sw, height: sh };
         }
 
-        console.log('[anchorX, anchorY]', [anchorX, anchorY])
         this.drawSprite({
-          uTranslatePx: [tx, ty],
+          uTranslatePx: [tx, ty],          // pivot (anchor position)
           uScalePx: [tw, th],
-          uAnchor: [anchorX, anchorY],
+          uAnchor: [anchorX, anchorY],     // sprite anchor in shader
           uRotation: totalRotation,
           uTex: node.texture,
           uAlpha: a,
@@ -308,9 +322,9 @@ class Host {
         });
       }
 
-      // Visit children with accumulated transform
+      // Children use ORIGIN (top-left after container anchor shift)
       for (const child of node.children) {
-        visit(child, x, y, a, mergedScissorCss, totalRotation);
+        visit(child, originX, originY, a, mergedScissorCss, totalRotation);
       }
     };
 
