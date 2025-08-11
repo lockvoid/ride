@@ -248,7 +248,7 @@ export class Component {
     this._depth = parent ? (parent._depth + 1) : 0;
 
     // Props
-    this.props = props || {};
+    this.props = {};
     this._stagedProps = null;
     this.prevProps = undefined;
 
@@ -280,7 +280,7 @@ export class Component {
     this._queueInitOp();
 
     // Accept immediate updates (pre-ready diff buffers ops)
-    this.update(this.props);
+    this.update(props || {});
   }
 
   getCommandBuffer() { return this._cmds; } // test helper (live object)

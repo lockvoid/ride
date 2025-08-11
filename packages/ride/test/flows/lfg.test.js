@@ -10,6 +10,28 @@ describe('Ride', () => {
     effects = [];
   });
 
+  it('diffs the initial props', async () => {
+    const host = createDeferred();
+
+    class App extends Component {
+      static progressive = { budget: Number.MAX_SAFE_INTEGER };
+
+      static async createHost() {
+        return host;
+      }
+
+      diff(prev = {}, next = {}) {
+        diffs.push({ prev, next });
+      }
+    }
+
+    const app = Ride.mount(App, { action: 'foo' });
+
+    await raf();
+
+    expect(diffs).toEqual([{ prev: {}, next: { action: 'foo' } }]);
+  });
+
   it('buffers operations before the host is ready', async () => {
     let buffer;
 
@@ -184,10 +206,10 @@ describe('Ride', () => {
 
     await raf();
 
-    expect(app.props).toEqual({ initial: true });
+    expect(app.props).toEqual({});
 
     expect(diffs[0]).toEqual({
-      prev: { initial: true },
+      prev: {},
       next: { initial: true, foo: 1 },
     });
 
@@ -199,10 +221,10 @@ describe('Ride', () => {
 
     await raf();
 
-    expect(app.props).toEqual({ initial: true });
+    expect(app.props).toEqual({});
 
     expect(diffs[0]).toEqual({
-      prev: { initial: true },
+      prev: {},
       next: { initial: true, foo: 1, bar: 2 },
     });
 
@@ -217,7 +239,7 @@ describe('Ride', () => {
     expect(app.props).toEqual({ initial: true, foo: 1, bar: 2, ready: true });
 
     expect(diffs[0]).toEqual({
-      prev: { initial: true },
+      prev: {},
       next: { initial: true, foo: 1, bar: 2, ready: true },
     });
 

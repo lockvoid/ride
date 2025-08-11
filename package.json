@@ -1,27 +1,16 @@
 {
-  "name": "@lockvoid/ride",
-  "version": "0.1.0",
+  "name": "ride-monorepo",
+  "version": "1.13.0",
   "license": "MIT",
   "author": "LockVoid",
-  "type": "module",
   "engines": {
     "node": "22.x",
     "pnpm": "10.x"
   },
-  "scripts": {
-    "test": "vitest run",
-    "coverage": "vitest run --coverage"
-  },
+  "workspaces": [
+    "packages/*"
+  ],
   "devDependencies": {
-    "@lockvoid/eslint-config": "^0.5.4",
-    "eslint": "^9.20.1",
-    "jsdom": "^26.1.0",
-    "vitest": "^3.2.4"
-  },
-  "exports": {
-    ".": {
-      "types": "./types/index.d.mts",
-      "default": "./src/index.js"
-    }
+    "semver": "^7.7.1"
   }
 }

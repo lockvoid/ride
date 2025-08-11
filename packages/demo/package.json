@@ -1,0 +1,27 @@
+{
+  "name": "ride-regl-demo",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "LockVoid",
+  "type": "module",
+  "engines": {
+    "node": "22.x",
+    "pnpm": "10.x"
+  },
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@lockvoid/ride": "workspace:*",
+    "@lockvoid/ride-regl": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^7.1.1"
+  },
+  "exports": {
+    ".": {
+      "types": "./types/index.d.mts",
+      "default": "./src/index.js"
+    }
+  }
+}

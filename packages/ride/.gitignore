@@ -1,4 +1,4 @@
-/tmp
+.env.example
 
 ##
 # https://github.com/github/gitignore/blob/main/Global/macOS.gitignore
@@ -164,6 +164,3 @@ out
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
-
-# Local Netlify folder
-.netlify
