@@ -115,57 +115,81 @@ class Host {
   }
 
   frame() {
-     console.log('[host] frame'); // should print at least once after mounting
+    const canvasW = Math.max(1, this.canvas.width);
+    const canvasH = Math.max(1, this.canvas.height);
+    const cssW = Math.max(1, this.canvas.clientWidth || canvasW);
+    const cssH = Math.max(1, this.canvas.clientHeight || canvasH);
+    const dprX = canvasW / cssW;
+    const dprY = canvasH / cssH;
 
-     const canvasW = Math.max(1, this.canvas.width);
-     const canvasH = Math.max(1, this.canvas.height);
-     const cssW = Math.max(1, this.canvas.clientWidth || canvasW);
-     const cssH = Math.max(1, this.canvas.clientHeight || canvasH);
-     const dprX = canvasW / cssW;
-     const dprY = canvasH / cssH;
+    const toDevice = (x, y, w, h) => [x * dprX, y * dprY, w * dprX, h * dprY];
 
-     const toDevice = (x, y, w, h) => [x * dprX, y * dprY, w * dprX, h * dprY];
+    const offsetRect = (r, ox, oy) => [r[0] + ox, r[1] + oy, r[2], r[3]];
 
-     const visit = (node, parentX, parentY, parentAlpha, inheritedScissor) => {
-       const p = node.props || {};
-       const x = (p.x || 0) + parentX;
-       const y = (p.y || 0) + parentY;
-       const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
-       const currentScissor = p.scissor || inheritedScissor;
+    const intersect = (a, b) => {
+      if (!a) return b;
+      if (!b) return a;
+      const x = Math.max(a[0], b[0]);
+      const y = Math.max(a[1], b[1]);
+      const r = Math.min(a[0] + a[2], b[0] + b[2]);
+      const btm = Math.min(a[1] + a[3], b[1] + b[3]);
+      const w = Math.max(0, r - x);
+      const h = Math.max(0, btm - y);
+      return w > 0 && h > 0 ? [x, y, w, h] : null;
+    };
 
-       if (node.kind === 'sprite' && node.texture) {
-         const w = p.width != null ? p.width : (node.texSize ? node.texSize[0] / dprX : 0);
-         const h = p.height != null ? p.height : (node.texSize ? node.texSize[1] / dprY : 0);
+    const visit = (node, absX, absY, parentAlpha, parentScissorCss) => {
+      const p = node.props || {};
+      const x = (p.x || 0) + absX;
+      const y = (p.y || 0) + absY;
+      const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
 
-         const scissorEnabled = Boolean(currentScissor);
-         let scissorBox = { x: 0, y: 0, width: 0, height: 0 };
-         if (scissorEnabled) {
-           const [sx, sy, sw, sh] = toDevice(...currentScissor);
-           scissorBox = { x: sx, y: canvasH - (sy + sh), width: sw, height: sh };
-         }
+      // Local scissor is in the node's local CSS space; offset to absolute CSS space
+      const localScissorCss = p.scissor ? offsetRect(p.scissor, x, y) : null;
+      // Intersect with ancestor scissor in CSS space
+      const mergedScissorCss = intersect(parentScissorCss, localScissorCss);
 
-         const [tx, ty, tw, th] = toDevice(x, y, w, h);
-         // Debug log once to verify numbers look sane
-         console.log('[host] draw sprite @', { tx, ty, tw, th, a });
+      if (node.kind === 'sprite' && node.texture) {
+        const wCss = p.width != null ? p.width : (node.texSize ? node.texSize[0] / dprX : 0);
+        const hCss = p.height != null ? p.height : (node.texSize ? node.texSize[1] / dprY : 0);
 
-         this.drawSprite({
-           uTranslatePx: [tx, ty],
-           uScalePx: [tw, th],
-           uTex: node.texture,
-           uAlpha: a,
-           scissorEnabled,
-           scissorBox,
-         });
-       }
+        // Convert position/size to device px
+        const [tx, ty, tw, th] = toDevice(x, y, wCss, hCss);
 
-       for (const child of node.children) visit(child, x, y, a, currentScissor);
-     };
+        let scissorEnabled = false;
+        let scissorBox = { x: 0, y: 0, width: 0, height: 0 };
+        if (mergedScissorCss) {
+          let [sx, sy, sw, sh] = toDevice(...mergedScissorCss);
+          // GL scissor is bottom-left origin
+          sx = Math.round(sx);
+          sy = Math.round(canvasH - (sy + sh));
+          sw = Math.max(0, Math.round(sw));
+          sh = Math.max(0, Math.round(sh));
+          if (sw > 0 && sh > 0) {
+            scissorEnabled = true;
+            scissorBox = { x: sx, y: sy, width: sw, height: sh };
+          }
+        }
 
-     this.regl.poll();
-     // ⬇️ visible clear color so we know draw happened
-     this.regl.clear({ color: [0.07, 0.08, 0.1, 1], depth: 1 });
-     visit(this.rootNode, 0, 0, 1, null);
-   }
+        this.drawSprite({
+          uTranslatePx: [tx, ty],
+          uScalePx: [tw, th],
+          uTex: node.texture,
+          uAlpha: a,
+          scissorEnabled,
+          scissorBox,
+        });
+      }
+
+      for (const child of node.children) {
+        visit(child, x, y, a, mergedScissorCss);
+      }
+    };
+
+    this.regl.poll();
+    this.regl.clear({ color: [0.07, 0.08, 0.1, 1], depth: 1 });
+    visit(this.rootNode, 0, 0, 1, null);
+  }
    setTexture(node, source) {
      if (node.texture) node.texture.destroy();
      node.texture = this.regl.texture(source);
