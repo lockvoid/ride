@@ -12,6 +12,7 @@
 // - Deterministic testing: Scheduler.whenIdle() + Ride.flushUntilIdle(app)
 // - Error surface: route errors to App.onError?.(err, { component, op, phase })
 // - Behaviors/traits: classes declare `static behaviors = [...]` (merged base→derived automatically)
+// - NEW: progressive.locality = 'depth' | 'subtree' (default 'depth')
 
 export const PRIORITY = Object.freeze({
   HIGHEST: 0,
@@ -119,7 +120,8 @@ class CommandBuffer {
 }
 
 /* ============================================================================
- * Scheduler (RAF + budget) with in-flight tracking & depth-gated yielding
+ * Scheduler (RAF + budget) with in-flight tracking, depth-gated yielding,
+ * and locality='subtree' processing.
  * ==========================================================================*/
 
 class Scheduler {
@@ -134,12 +136,37 @@ class Scheduler {
     // In-flight flush tracking (for deterministic tests/tools)
     this._inFlight = null;          // Promise | null
     this._resolveInFlight = null;   // () => void | null
+
+    // Locality (during flush)
+    this._duringFlush = false;
+    this._localityRoot = null;     // root component when processing locality='subtree'
+    this._localityMode = 'depth';  // 'depth' | 'subtree'
+    this._localQueue = null;       // Set<Component> of newly dirtied descendants
   }
 
   setFrameBudget(ms) { this.frameBudgetMs = ms; }
   getFrameBudget() { return this.frameBudgetMs; }
 
+  static _isDescendant(node, root) {
+    for (let p = node; p; p = p.parent) if (p === root) return true;
+    return false;
+  }
+
   markDirty(component) {
+    // If we're currently flushing a locality='subtree' root, pull dirty descendants
+    // into the *current* frame via the local queue.
+    if (
+      this._duringFlush &&
+      this._localityMode === 'subtree' &&
+      this._localityRoot &&
+      Scheduler._isDescendant(component, this._localityRoot)
+    ) {
+      if (!this._localQueue) this._localQueue = new Set();
+      this._localQueue.add(component);
+      // Do NOT schedule a new RAF; we will drain locals in this same flush.
+      return;
+    }
+
     this.dirty.add(component);
     if (!this.scheduled) {
       this.scheduled = true;
@@ -151,6 +178,7 @@ class Scheduler {
     // Serialize overlapping calls
     if (this._inFlight) await this._inFlight;
     this._inFlight = new Promise(res => { this._resolveInFlight = res; });
+    this._duringFlush = true;
 
     this.scheduled = false;
 
@@ -178,9 +206,8 @@ class Scheduler {
       // Depth group gating: don't split siblings at the same depth
       let groupDepth = batch.length ? (batch[0]._depth | 0) : null;
       const shouldYieldBetweenComponents = (nextDepth) => {
-        // If still within same depth group, ignore budget pressure
+        if (this._localityMode === 'subtree') return false; // locality processing ignores depth gating
         if (groupDepth != null && nextDepth === groupDepth) return false;
-        // Crossing into a new depth? now we can consider yielding
         return shouldYield();
       };
 
@@ -193,35 +220,36 @@ class Scheduler {
       }
 
       const hosts = new Set();
+      let stop = false;
 
-      for (let i = 0; i < batch.length; i++) {
-        const component = batch[i];
-        if (component._destroyed) continue;
+      const processOne = async (component, { allowDepthYield }) => {
+        if (component._destroyed) return false;
 
         // Ensure node attached (idempotent)
         try {
           await component._ensureAttached();
         } catch (err) {
           component.runtime.reportError(err, { component, op: null, phase: 'attach' });
-          continue;
+          return false;
         }
 
-        // Drain this component once per frame (op-level shouldYield is still allowed)
+        // Drain this component once per frame
         if (component._cmds.size > 0) {
           const drained = await component._cmds.drain(
             component._effect.bind(component),
             shouldYield,
           );
-          if (!drained) this.dirty.add(component);
+          if (!drained) {
+            this.dirty.add(component);
+            return true; // yielded
+          }
         }
 
         // Initial commit (after possible pre-ready diffs)
         if (!component._hasInitialized) {
-          // Do not split siblings at same depth group
-          if (shouldYieldBetweenComponents(component._depth | 0)) {
+          if (allowDepthYield && shouldYieldBetweenComponents(component._depth | 0)) {
             this.dirty.add(component);
-            for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
-            break;
+            return true; // yielded between components
           }
 
           try {
@@ -230,16 +258,66 @@ class Scheduler {
             component.runtime.reportError(err, { component, op: null, phase: 'initial-diff' });
           }
 
-          // Anything queued during init/commit runs next RAF
+          // Anything queued during init/commit runs next RAF (unless captured by locality)
           if (component._cmds.size > 0) this.dirty.add(component);
         }
 
         if (component.runtime?.host) hosts.add(component.runtime.host);
+        return false;
+      };
+
+      for (let i = 0; i < batch.length && !stop; i++) {
+        const component = batch[i];
+
+        // Set locality root per component
+        const loc = component.constructor?.progressive?.locality ?? 'depth';
+        this._localityMode = loc;
+        this._localityRoot = (loc === 'subtree') ? component : null;
+        this._localQueue = null;
+
+        // Process the component itself with depth gating
+        const yielded = await processOne(component, { allowDepthYield: true });
+        if (yielded) {
+          // Requeue remaining components in this batch
+          for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
+          stop = true;
+        } else if (this._localityRoot) {
+          // Drain any locally dirtied descendants (subtree locality)
+          while (!stop && this._localQueue && this._localQueue.size) {
+            const locals = [...this._localQueue];
+            this._localQueue.clear();
+
+            // Sort locals with the same comparator
+            locals.sort((a, b) =>
+              ((a._depth | 0) - (b._depth | 0)) ||
+              ((a._componentPriority | 0) - (b._componentPriority | 0)) ||
+              ((a._createdAt | 0) - (b._createdAt | 0)),
+            );
+
+            for (let k = 0; k < locals.length; k++) {
+              const lc = locals[k];
+              const y = await processOne(lc, { allowDepthYield: false }); // no depth-gating inside subtree
+              if (y || shouldYield()) {
+                // Budget pressure: requeue remaining locals and batch
+                for (let m = k; m < locals.length; m++) this.dirty.add(locals[m]);
+                for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
+                stop = true;
+                break;
+              }
+            }
+          }
+        }
+
+        // Clear locality context before moving on
+        this._localityRoot = null;
+        this._localQueue = null;
+        this._localityMode = 'depth';
+
+        if (stop) break;
 
         // End of component: update groupDepth and maybe yield *between* components
         const nextDepth = (i + 1) < batch.length ? (batch[i + 1]._depth | 0) : (groupDepth == null ? null : groupDepth + 1);
         if (nextDepth !== null && nextDepth !== groupDepth) {
-          // we're about to enter a deeper (or different) depth group
           if (shouldYieldBetweenComponents(nextDepth)) {
             for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
             break;
@@ -256,6 +334,10 @@ class Scheduler {
       const done = this._resolveInFlight;
       this._resolveInFlight = null;
       this._inFlight = null;
+      this._duringFlush = false;
+      this._localityRoot = null;
+      this._localityMode = 'depth';
+      this._localQueue = null;
       done?.();
     }
   }
