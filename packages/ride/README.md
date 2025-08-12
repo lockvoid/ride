@@ -1,9 +1,12 @@
 
+
 # Ride
 
-Tiny, host-agnostic orchestration runtime for **data** → **ops** → **effect**.
+![Ride](https://pub-464e6b9480014239a02034726cf0073c.r2.dev/ride.jpg)
 
-Ride gives you a `Component` base, a batched `Scheduler`, and a single-entry `effect(op)` API. It knows nothing about Pixi/DOM/Canvas — you plug in a host adapter (e.g., Pixi v8) and write components that **enqueue ops**, not re-renders.
+Tiny, host-agnostic orchestration runtime for **data** → **op** → **effect**.
+
+Ride gives you a `Component` base, a batched `Scheduler`, and a single-entry `Op x Effect` API. It knows nothing about Pixi/DOM/Canvas — you plug in a host adapter (e.g., Pixi v8) and write components that **enqueue ops**, not re-renders.
 
 ---
 
@@ -663,6 +666,4 @@ expect(idxSidebar).toBeGreaterThan(idxInfo0);  // unrelated stays after the subt
 
 ## License
 
-MIT.
-
-LockVoid Labs
+MIT © LockVoid Labs \~●~
