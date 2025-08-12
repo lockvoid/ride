@@ -1,5 +1,5 @@
 import { Ride, Component } from '@lockvoid/ride';
-import { Host, Scene, Sprite } from '@lockvoid/ride-regl';
+import { Host, Scene, Sprite, Typography } from '@lockvoid/ride-regl';
 
 function fitCanvasTo(container, canvas) {
   const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
@@ -21,6 +21,8 @@ class App extends Component {
 
   static async createHost(props) {
     const host = await Host.create({ container: props.container, autoResize: { policy: 'live' } });
+
+    await host.registerFont('Inter-Regular', { fontUrl: '/public/Inter-Regular.fnt' });
 
     return host;
   }
@@ -55,7 +57,7 @@ class App extends Component {
 
     // ⬇️ mount INTO the scene, not the app
     const sprite = scene2.mount(Sprite, {
-      x: 0, y: 0, width: 400, height: 400, alpha: 1, source: bmp,anchor: [0,0],
+      x: 1000, y: 100, width: 400, height: 400, alpha: 1, source: bmp,anchor: [0.5,0.5],
     });
 
     setInterval(() => {
@@ -65,10 +67,20 @@ class App extends Component {
     let rotation = 0;
     let i = 0;
     const rotate = () => {
-      scene.update({ rotation: rotation += 0.01 });
+      sprite.update({ rotation: rotation += 0.01 });
 
       requestAnimationFrame(rotate)
     };
+
+    scene.mount(Typography, {
+      fontName: 'Inter-Regular',
+      text: 'Hello MSDF wdcnwjdncjwdncj !',
+      fontSize: 62,
+      x: 24, y: 48,
+      color: '#ffffff',
+      truncateWidth: 160,
+    });
+
 
     rotate();
   }
