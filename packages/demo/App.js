@@ -82,11 +82,11 @@ class App extends Component {
 
    scene.mount(Typography, {
      fontName: 'Inter-Regular',
-     text: 'Hello MSDF wdcnwjdncjwdncj !',
+     text: 'Text rendered using GPU! And supports trimming',
      fontSize: 16,
      x: 24, y: 48,
      color: '#ffffff',
-     truncateWidth: 160,
+     truncateWidth: 350,
      onPointerIn:  (e) => console.log('[text] enter'),
      onPointerOut: (e) => console.log('[text] leave'),
      onPointerMove: (e) => console.log('[text] move'),
