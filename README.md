@@ -452,13 +452,6 @@ export class Scene extends Component {
 
 ---
 
-**Notes**
-- `overscanRows`: default 1. Raise to 2–3 if you see pop-in on fast scrolls.
-- Virtualization and culling stack fine; virtualization does the heavy lifting.
-
-
----
-
 # Locality-driven scheduling (depth vs subtree)
 
 Ride’s scheduler orders components by **depth → componentPriority → creationOrder** and slices work by a frame **budget**. How it *yields* between components is controlled by **locality**:
@@ -485,23 +478,6 @@ You can also set `locality` on a subtree root class (e.g., `Item`) to prioritize
 - **`subtree`**: better perceived latency for lists/grids — each card feels complete sooner.
 
 > Only **descendants of the current root** are pulled forward in `subtree` mode; unrelated siblings elsewhere in the tree are not interleaved.
-
-### Putting it together
-
-```ts
-export class Scene extends Component {
-  static behaviors = [GeometryBehavior({ includeSize: true }), EventsBehavior()];
-}
-
-export class Sprite extends Component {
-  static behaviors = [GeometryBehavior({ includeSize: true }), EventsBehavior()];
-  // add local TextureBehavior() right in this file if needed
-}
-
-export class Typography extends Component {
-  static behaviors = [TypographyBehavior(), GeometryBehavior(), EventsBehavior()];
-}
-```
 
 ---
 
