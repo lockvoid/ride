@@ -77,7 +77,7 @@ class App extends Component {
     const rotate = () => {
       sprite.update({ rotation: rotation += 0.01 });
 
-     //  requestAnimationFrame(rotate)
+       requestAnimationFrame(rotate)
     };
 
    scene.mount(Typography, {

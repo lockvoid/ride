@@ -2,12 +2,14 @@ import { Ride, Component, DIFF } from '../../src/index.js';
 import { MockHost, tick, delay, raf, createDeferred } from '../helpers';
 
 describe('Ride', () => {
-  let diffs = [];
-  let effects = [];
+  let diffs;
+  let effects;
+  let log;
 
   beforeEach(() => {
     diffs = [];
     effects = [];
+    log = [];
   });
 
   it('diffs the initial props', async () => {
@@ -622,5 +624,204 @@ describe('Ride', () => {
 
     expect(parent.context).toEqual({ foo: 'bar' });
     expect(child.context).toEqual({ foo: 'bar' });
+  });
+
+
+  it('runs cleanup before the next effect for the same key', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+
+      async init() {
+        // 1) queue first subscription
+        this.queue('subscribe', { v: 1 }); // key = type = 'subscribe'
+      }
+
+      effect(op) {
+        log.push(`effect:${op.payload.v}`);
+        // return cleanup capturing this op's value
+        return () => { log.push(`cleanup:${op.payload.v}`); };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    // Frame 1: only @ride/init in buffer
+    await raf();
+
+    // Frame 2: buffered ops visible, nothing ran yet
+    await raf();
+
+    // Frame 3: effect for v=1 runs
+    await raf();
+    expect(log).toEqual(['effect:1']);
+
+    // Now schedule replacement of the same key
+    app.queue('subscribe', { v: 2 });
+
+    // Next buffer frame
+    await raf();
+
+    // Next effect frame: cleanup(old) → effect(new)
+    await raf();
+    expect(log).toEqual(['effect:1', 'cleanup:1', 'effect:2']);
+  });
+
+  it('coalescing before first run does not produce extra cleanups', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+
+      async init() {
+        this.queue('position', { x: 1, y: 1 });
+        this.queue('position', { x: 2, y: 2 }); // coalesced with same key
+      }
+
+      effect(op) {
+        log.push(`effect:${op.type}:${op.payload.x},${op.payload.y}`);
+        return () => { log.push(`cleanup:${op.type}`); };
+      }
+    }
+
+    Ride.mount(App, {});
+
+    await raf(); // @ride/init only
+    await raf(); // buffer has coalesced 'position'
+    await raf(); // runs single effect
+
+    expect(log).toEqual(['effect:position:2,2']); // only one effect
+    // no cleanup yet (only runs on replace or unmount)
+  });
+
+  it('runs all per-key cleanups on unmount (plus init cleanup if provided)', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+
+      async init() {
+        // return component-scope cleanup as well
+        return () => { log.push('init-cleanup'); };
+      }
+
+      async diff() {
+        // queue two different keys
+        this.queue('a', { i: 1 });
+        this.queue('b', { i: 2 });
+      }
+
+      effect(op) {
+        log.push(`effect:${op.type}`);
+        return () => { log.push(`cleanup:${op.type}`); };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf(); // @ride/init
+    await raf(); // buffer has a,b
+    await raf(); // effects for a,b
+
+    // Now unmount (should run cleanup:a, cleanup:b, then init-cleanup)
+    await Ride.unmount(app);
+
+    // Order of a/b cleanups is not guaranteed; init-cleanup is last
+    const withoutLast = log.slice(0, -1).sort();
+    expect(withoutLast).toEqual(['cleanup:a', 'cleanup:b', 'effect:a', 'effect:b'].sort());
+    expect(log.at(-1)).toBe('init-cleanup');
+  });
+
+  it('awaits async cleanup before running the next effect for the same key', async () => {
+    const log = [];
+
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      async init() { this.queue('sub', { step: 1 }); }
+      effect(op) {
+        log.push(`effect:${op.payload.step}`);
+        return async () => {
+          log.push(`cleanup-start:${op.payload.step}`);
+          await timeout(10); // simulate async teardown inside cleanup
+          log.push(`cleanup-done:${op.payload.step}`);
+        };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    // First effect
+    await raf(); // schedule @ride/init flush
+    await Ride.flushUntilIdle(app);
+    expect(log).toEqual(['effect:1']);
+
+    // Replace same key -> must run cleanup(1) fully before effect(2)
+    app.queue('sub', { step: 2 });
+
+    await raf(); // schedule replacement flush
+    await Ride.flushUntilIdle(app);
+
+    expect(log).toEqual([
+      'effect:1',
+      'cleanup-start:1',
+      'cleanup-done:1',
+      'effect:2',
+    ]);
+  });
+
+  it('does not run any cleanup pre-ready (effects haven’t run yet)', async () => {
+    // We simulate by queuing multiple ops pre-ready; only last effect runs once,
+    // and no cleanup occurs until a later replacement or unmount.
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+
+      async init() {
+        this.queue('keyX', { n: 1 });
+        this.queue('keyX', { n: 2 }); // coalesced pre-ready
+      }
+
+      effect(op) {
+        log.push(`effect:${op.payload.n}`);
+        return () => { log.push(`cleanup:${op.payload.n}`); };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf(); // @ride/init
+    await raf(); // buffer has single keyX(n=2)
+    await raf(); // effect(2) runs
+
+    expect(log).toEqual(['effect:2']); // no cleanup yet
+
+    // Unmount triggers one cleanup (for n=2)
+    await Ride.unmount(app);
+    expect(log).toEqual(['effect:2', 'cleanup:2']);
+  });
+
+  it('cleanup lifecycle: replace and unmount', async () => {
+    const calls = [];
+
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      async init() { this.queue('subscribe', { id: 'A' }); }
+      effect(op) {
+        calls.push(`effect:${op.payload.id}`);
+        return () => { calls.push(`cleanup:${op.payload.id}`); };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf(); // @ride/init
+    await raf(); // buffer
+    await raf(); // effect A
+
+    app.queue('subscribe', { id: 'B' });
+    await raf(); // buffer
+    await raf(); // cleanup A → effect B
+
+    await Ride.unmount(app); // cleanup B
+
+    expect(calls).toEqual([
+      'effect:A',
+      'cleanup:A',
+      'effect:B',
+      'cleanup:B',
+    ]);
   });
 });

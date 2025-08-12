@@ -8,6 +8,8 @@
 // - Single-queue snapshot drain; ops queued during drain run next RAF
 // - Scheduler batch order: depth -> componentPriority -> creationOrder
 // - No RAF scheduled while not ready (keeps buffers inspectable in tests)
+// - effect(op) may return a cleanup fn; it runs before the next effect of the same key and on unmount.
+// - Deterministic testing: Scheduler.whenIdle() + Ride.flushUntilIdle(app)
 
 /* ============================================================================
  * Constants
@@ -119,16 +121,25 @@ class CommandBuffer {
 }
 
 /* ============================================================================
- * Scheduler (RAF + budget)
+ * Scheduler (RAF + budget) with in-flight tracking
  * ==========================================================================*/
 
 class Scheduler {
-  constructor({ frameBudgetMs = 8 } = {}) {
+  constructor({ frameBudgetMs = 8, debug = false, onYield = null } = {}) {
     this.dirty = new Set();
     this.scheduled = false;
     this.frameBudgetMs = frameBudgetMs;
+    this.debug = debug;
+    this.onYield = onYield;
     this._frameStart = 0;
+
+    // In-flight flush tracking (for deterministic tests/tools)
+    this._inFlight = null;          // Promise | null
+    this._resolveInFlight = null;   // () => void | null
   }
+
+  setFrameBudget(ms) { this.frameBudgetMs = ms; }
+  getFrameBudget() { return this.frameBudgetMs; }
 
   markDirty(component) {
     this.dirty.add(component);
@@ -139,88 +150,93 @@ class Scheduler {
   }
 
   async flush() {
+    // Serialize overlapping calls
+    if (this._inFlight) await this._inFlight;
+    this._inFlight = new Promise(res => { this._resolveInFlight = res; });
+
     this.scheduled = false;
-    if (!this.dirty.size) return;
 
-    this._frameStart = performance.now();
-    const noBudget = this.frameBudgetMs <= 0 || !Number.isFinite(this.frameBudgetMs);
-    const shouldYield = () => {
-      if (noBudget) {
-        return false;
+    try {
+      if (!this.dirty.size) return;
+
+      this._frameStart = performance.now();
+      const noBudget = this.frameBudgetMs <= 0 || !Number.isFinite(this.frameBudgetMs);
+      const shouldYield = () => {
+        if (noBudget) return false;
+        const elapsed = performance.now() - this._frameStart;
+        const exceeded = elapsed >= this.frameBudgetMs;
+        if (exceeded && this.onYield) this.onYield(elapsed);
+        return exceeded;
+      };
+
+      // Component batch: depth -> componentPriority -> creationOrder
+      const batch = [...this.dirty].sort((a, b) =>
+        ((a._depth | 0) - (b._depth | 0)) ||
+        ((a._componentPriority | 0) - (b._componentPriority | 0)) ||
+        ((a._createdAt | 0) - (b._createdAt | 0)),
+      );
+      this.dirty.clear();
+
+      // If any not ready, keep them dirty and do nothing this frame
+      const anyNotReady = batch.some(c => !c.runtime.isReady);
+      if (anyNotReady) {
+        for (const c of batch) if (!c.runtime.isReady) this.dirty.add(c);
+        if (this.dirty.size) this._scheduleNext();
+        return;
       }
 
-      const exceededBudget = (performance.now() - this._frameStart) >= this.frameBudgetMs;
+      const hosts = new Set();
 
-      if (exceededBudget) {
-        console.log('!!!!!!!!!!!!!');
-        console.log('!!!!!!!!!!!!!');
-        console.log('!!!!!!!!!!!!!');
-        console.log('!!!!!!!!!!!!!');
-      }
+      for (let i = 0; i < batch.length; i++) {
+        const component = batch[i];
+        if (component._destroyed) continue;
 
-      return exceededBudget;
-    };
-    // Component batch: depth -> componentPriority -> creationOrder
-    const batch = [...this.dirty].sort((a, b) =>
-      ((a._depth | 0) - (b._depth | 0)) ||
-      ((a._componentPriority | 0) - (b._componentPriority | 0)) ||
-      ((a._createdAt | 0) - (b._createdAt | 0)),
-    );
-    this.dirty.clear();
+        // Ensure node attached (idempotent)
+        await component._ensureAttached();
 
-    // If any not ready, keep them dirty and do nothing this frame
-    const anyNotReady = batch.some(c => !c.runtime.isReady);
-    if (anyNotReady) {
-      for (const c of batch) if (!c.runtime.isReady) this.dirty.add(c);
-      if (this.dirty.size) this._scheduleNext();
-      return;
-    }
+        // Drain this component once per frame
+        if (component._cmds.size > 0) {
+          const drained = await component._cmds.drain(
+            component._effect.bind(component),
+            shouldYield,
+          );
+          if (!drained) this.dirty.add(component);
+        }
 
-    const hosts = new Set();
+        // Initial commit (after possible pre-ready diffs)
+        if (!component._hasInitialized) {
+          if (shouldYield()) {
+            this.dirty.add(component);
+            // Requeue remaining components in this batch for next RAF
+            for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
+            break;
+          }
 
-    for (let i = 0; i < batch.length; i++) {
-      const component = batch[i];
+          await component._runInitialDiff();
 
-      // Ensure node attached (idempotent)
-      await component._ensureAttached();
+          // Anything queued during init/commit runs next RAF
+          if (component._cmds.size > 0) this.dirty.add(component);
+        }
 
-      // Drain this component once per frame
+        if (component.runtime?.host) hosts.add(component.runtime.host);
 
-      if (component._cmds.size > 0) {
-        const drained = await component._cmds.drain(
-          component._effect.bind(component),
-          shouldYield,
-        );
-        if (!drained) this.dirty.add(component);
-      }
-
-      // Initial commit (after possible pre-ready diffs)
-      if (!component._hasInitialized) {
         if (shouldYield()) {
-          this.dirty.add(component);
           // Requeue remaining components in this batch for next RAF
           for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
           break;
         }
-
-        await component._runInitialDiff();
-
-        // Anything queued during init/commit runs next RAF
-        if (component._cmds.size > 0) this.dirty.add(component);
       }
 
-      if (component.runtime?.host) hosts.add(component.runtime.host);
+      for (const host of hosts) host.requestRender?.();
 
-      if (shouldYield()) {
-        // Requeue remaining components in this batch for next RAF
-        for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
-        break;
-      }
+      if (this.dirty.size) this._scheduleNext();
+    } finally {
+      // Resolve in-flight for *this* flush call
+      const done = this._resolveInFlight;
+      this._resolveInFlight = null;
+      this._inFlight = null;
+      done?.();
     }
-
-    for (const host of hosts) host.requestRender?.();
-
-    if (this.dirty.size) this._scheduleNext();
   }
 
   _scheduleNext() {
@@ -228,6 +244,31 @@ class Scheduler {
       this.scheduled = true;
       requestAnimationFrame(() => this.flush());
     }
+  }
+
+  /**
+   * Deterministic wait: run/await flushes until there are no pending frames or work.
+   */
+  async whenIdle({ max = 100 } = {}) {
+    for (let i = 0; i < max; i++) {
+      // If a flush is in progress, await it.
+      if (this._inFlight) await this._inFlight;
+
+      // If a flush is scheduled (next rAF) but not started, run it now.
+      if (this.scheduled) {
+        await this.flush();
+        continue;
+      }
+
+      // If there is work but not scheduled, flush now.
+      if (this.dirty.size) {
+        await this.flush();
+        continue;
+      }
+
+      return; // idle
+    }
+    throw new Error('Scheduler.whenIdle(): exceeded max iterations');
   }
 }
 
@@ -288,6 +329,10 @@ export class Component {
     // Node
     this.node = null;
 
+    // Cleanups (per-op key) and optional init cleanup
+    this._cleanups = new Map(); // key -> () => (void|Promise)
+    this._initCleanup = null;
+
     // Ready promise (host + parent)
     this._setupReadyPromise();
 
@@ -318,6 +363,12 @@ export class Component {
     return this.runtime.host.rootNode;
   }
 
+  _commit(next) {
+    this.prevProps = this.props;
+    this.props = next;
+    this._stagedProps = null;
+  }
+
   async _runInitialDiff() {
     if (!this._needsInitialDiff) return;
 
@@ -326,13 +377,11 @@ export class Component {
 
     if (this._preReadyDiffRan) {
       // Already ran diff pre-ready to buffer ops; just commit props now.
-      this.props = next;
-      this._stagedProps = null;
+      this._commit(next);
     } else {
       const result = await this._runDiff(prev, next);
       if (result !== DIFF.DEFER) {
-        this.props = next;
-        this._stagedProps = null;
+        this._commit(next);
       }
     }
 
@@ -355,13 +404,27 @@ export class Component {
     if (op.type === '@ride/init') {
       if (!this._initDone) {
         const maybe = this.init();
-        if (maybe && typeof maybe.then === 'function') await maybe;
+        const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+        if (typeof res === 'function') this._initCleanup = res;
         this._initDone = true;
       }
       return; // swallowed
     }
+
+    // Per-key cleanup: run old cleanup for this key before applying new effect
+    const key = op.key;
+    const prevCleanup = key != null ? this._cleanups.get(key) : null;
+    if (prevCleanup) {
+      try { await prevCleanup(); } catch (e) { /* swallow cleanup errors */ }
+      this._cleanups.delete(key);
+    }
+
     if (typeof this.effect === 'function') {
-      return this.effect(op);
+      const maybe = this.effect(op);
+      const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+      if (typeof res === 'function' && key != null) {
+        this._cleanups.set(key, res);
+      }
     }
   }
 
@@ -377,7 +440,6 @@ export class Component {
     const next = Object.assign({}, base, patch);
 
     this._stagedProps = next;
-    this.prevProps = { ...prev };
 
     if (this.runtime.isReady) {
       this._needsInitialDiff = false;
@@ -393,8 +455,7 @@ export class Component {
     const result = await this._runDiff(prev, next);
     if (this._destroyed) return;
     if (result !== DIFF.DEFER) {
-      this.props = next;
-      this._stagedProps = null;
+      this._commit(next);
     }
     if (this.runtime.isReady && this._cmds.size) {
       this.runtime.scheduler.markDirty(this);
@@ -432,11 +493,35 @@ export class Component {
     if (this._children.delete(child)) await child.destroy();
   }
 
+  setPriority(priority) {
+    this._componentPriority = priority | 0;
+  }
+
   async destroy() {
     this._destroyed = true;
+
+    // Stop any queued ops from running post-destroy
+    this._cmds.ops.length = 0;
+    this._cmds.index.clear();
+    this._cmds.size = 0;
+
+    // Destroy children first
     for (const child of this._children) await child.destroy();
     this._children.clear();
 
+    // Run all per-key cleanups
+    for (const [, fn] of this._cleanups) {
+      try { await fn(); } catch (e) { /* swallow cleanup errors */ }
+    }
+    this._cleanups.clear();
+
+    // Run init-scope cleanup last
+    if (typeof this._initCleanup === 'function') {
+      try { await this._initCleanup(); } catch (e) { /* swallow */ }
+      this._initCleanup = null;
+    }
+
+    // Detach/destroy node
     if (this.node && this.runtime.host) {
       const parentNode = this.node.parent ?? this.runtime.host.rootNode;
       if (parentNode) this.runtime.host.detachNode(parentNode, this.node);
@@ -506,5 +591,10 @@ export class Ride {
   static async unmount(app) {
     await app.destroy();
     app.runtime.host?.teardown?.();
+  }
+
+  // Deterministic flushing for tests/tools
+  static async flushUntilIdle(app, opts) {
+    await app.runtime.scheduler.whenIdle(opts);
   }
 }
