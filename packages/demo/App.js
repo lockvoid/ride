@@ -58,6 +58,14 @@ class App extends Component {
     // ⬇️ mount INTO the scene, not the app
     const sprite = scene2.mount(Sprite, {
       x: 1000, y: 100, width: 400, height: 400, alpha: 1, source: bmp,anchor: [0.5,0.5],
+
+      pointerEvents: 'auto',
+      onPointerIn:  (e) => console.log('[sprite] enter'),
+      onPointerOut: (e) => console.log('[sprite] leave'),
+      onPointerMove: (e) => console.log('[sprite] move'),
+      onPointerDown:(e) => console.log('[sprite] down', e.button),
+      onPointerUp:  (e) => console.log('[sprite] up'),
+      onClick:      (e) => { console.log('[sprite] click (stop here)'); e.stopPropagation(); },
     });
 
     setInterval(() => {
@@ -79,6 +87,12 @@ class App extends Component {
      x: 24, y: 48,
      color: '#ffffff',
      truncateWidth: 160,
+     onPointerIn:  (e) => console.log('[text] enter'),
+     onPointerOut: (e) => console.log('[text] leave'),
+     onPointerMove: (e) => console.log('[text] move'),
+     onPointerDown:(e) => console.log('[text] down', e.button),
+     onPointerUp:  (e) => console.log('[text] up'),
+     onClick:      (e) => { console.log('[text] click (stop here)'); e.stopPropagation(); },
    });
 
 

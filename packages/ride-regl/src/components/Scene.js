@@ -1,4 +1,4 @@
-// packages/ride-regl/components/Scene.js
+// packages/ride-regl/components/Container.js
 import { Component } from '@lockvoid/ride';
 
 const sameAnchor = (a, b) => {
@@ -6,9 +6,10 @@ const sameAnchor = (a, b) => {
   if (!Array.isArray(a) || !Array.isArray(b)) return false;
   return a[0] === b[0] && a[1] === b[1];
 };
+const sameFns = (a, b, keys) => keys.every(k => a[k] === b[k]);
 
 class Scene extends Component {
-  createNode() { return this.runtime.host.createNode(this, 'scene'); }
+  createNode() { return this.runtime.host.createNode(this, 'container'); }
 
   diff(prev = {}, next = {}) {
     const geomChanged =
@@ -31,10 +32,24 @@ class Scene extends Component {
         scissor: next.scissor || null,
       }, { key: `${this._createdAt}:props` });
     }
+
+    // EVENTS
+    const evKeys = [
+      'onPointerDown','onPointerUp','onPointerMove','onPointerIn','onPointerOut',
+      'onClick','onWheel','onTouchDown','pointerEvents'
+    ];
+    const eventsChanged = !sameFns(prev, next, evKeys);
+    if (eventsChanged) {
+      const payload = {};
+      for (const k of evKeys) if (k in next) payload[k] = next[k];
+      this.queue('SET_EVENTS', payload, { key: `${this._createdAt}:events` });
+    }
   }
 
   async effect(op) {
-    if (op.type === 'SET_PROPS') this.runtime.host.setProps(this.node, op.payload);
+    const host = this.runtime.host;
+    if (op.type === 'SET_PROPS') return host.setProps(this.node, op.payload);
+    if (op.type === 'SET_EVENTS') return host.setEvents(this.node, op.payload);
   }
 }
 

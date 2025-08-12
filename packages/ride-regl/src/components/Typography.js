@@ -14,12 +14,13 @@ const sameShadow = (a, b) => {
          ((a.softness ?? 0)|0) === ((b.softness ?? 0)|0) &&
          a.color === b.color;
 };
+const sameFns = (a, b, keys) => keys.every(k => a[k] === b[k]);
 
 class Typography extends Component {
   createNode() { return this.runtime.host.createTextNode(this); }
 
   diff(prev = {}, next = {}) {
-    // 1) Text-related props (host.setTextProps)
+    // Text metrics/appearance
     const textChanged =
       prev.text !== next.text ||
       prev.fontName !== next.fontName ||
@@ -41,19 +42,19 @@ class Typography extends Component {
             dy: next.shadow.dy ?? 1,
             color: next.shadow.color ?? '#000000',
             softness: next.shadow.softness ?? 0,
-          } : null,                               // { dx, dy, color, softness } or null
+          } : null,
           truncateWidth: Number.isFinite(next.truncateWidth) ? next.truncateWidth : Infinity,
         },
         { key: `${this._createdAt}:textprops` }
       );
     }
 
-    // 2) Transform/visibility (host.setProps) — same pattern as Sprite
+    // Transform/visibility
     const geomChanged =
       (prev.x|0) !== (next.x|0) ||
       (prev.y|0) !== (next.y|0) ||
       prev.alpha !== next.alpha ||
-      prev.rotation !== next.rotation ||   // radians
+      prev.rotation !== next.rotation ||
       !sameAnchor(prev.anchor, next.anchor) ||
       prev.scissor !== next.scissor;
 
@@ -66,21 +67,30 @@ class Typography extends Component {
           alpha: next.alpha == null ? 1 : next.alpha,
           rotation: next.rotation || 0,        // radians
           anchor: Array.isArray(next.anchor) ? next.anchor : [0, 0],
-          scissor: next.scissor || null,       // [x,y,w,h] in CSS px, like Sprite
+          scissor: next.scissor || null,
         },
         { key: `${this._createdAt}:props` }
       );
+    }
+
+    // EVENTS
+    const evKeys = [
+      'onPointerDown','onPointerUp','onPointerMove','onPointerIn','onPointerOut',
+      'onClick','onWheel','onTouchDown','pointerEvents'
+    ];
+    const eventsChanged = !sameFns(prev, next, evKeys);
+    if (eventsChanged) {
+      const payload = {};
+      for (const k of evKeys) if (k in next) payload[k] = next[k];
+      this.queue('SET_EVENTS', payload, { key: `${this._createdAt}:events` });
     }
   }
 
   async effect(op) {
     const host = this.runtime.host;
-    if (op.type === 'SET_TEXT_PROPS') {
-      return host.setTextProps(this.node, op.payload);
-    }
-    if (op.type === 'SET_PROPS') {
-      return host.setProps(this.node, op.payload);
-    }
+    if (op.type === 'SET_TEXT_PROPS') return host.setTextProps(this.node, op.payload);
+    if (op.type === 'SET_PROPS') return host.setProps(this.node, op.payload);
+    if (op.type === 'SET_EVENTS') return host.setEvents(this.node, op.payload);
   }
 }
 
