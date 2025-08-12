@@ -22,7 +22,7 @@ class App extends Component {
   static async createHost(props) {
     const host = await Host.create({ container: props.container, autoResize: { policy: 'live' } });
 
-    await host.registerFont('Inter-Regular', { fontUrl: '/public/Inter-Regular.fnt' });
+    await host.registerFont('Inter-Regular', { fontUrl: '/public/Inter-Regular.json' });
 
     return host;
   }
@@ -69,17 +69,17 @@ class App extends Component {
     const rotate = () => {
       sprite.update({ rotation: rotation += 0.01 });
 
-      requestAnimationFrame(rotate)
+     //  requestAnimationFrame(rotate)
     };
 
-    scene.mount(Typography, {
-      fontName: 'Inter-Regular',
-      text: 'Hello MSDF wdcnwjdncjwdncj !',
-      fontSize: 62,
-      x: 24, y: 48,
-      color: '#ffffff',
-      truncateWidth: 160,
-    });
+   scene.mount(Typography, {
+     fontName: 'Inter-Regular',
+     text: 'Hello MSDF wdcnwjdncjwdncj !',
+     fontSize: 16,
+     x: 24, y: 48,
+     color: '#ffffff',
+     truncateWidth: 160,
+   });
 
 
     rotate();

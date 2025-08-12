@@ -11,7 +11,7 @@ const sameShadow = (a, b) => {
   if (!a || !b) return false;
   return (a.dx|0) === (b.dx|0) &&
          (a.dy|0) === (b.dy|0) &&
-         (a.softnessPx|0) === (b.softnessPx|0) &&
+         ((a.softness ?? 0)|0) === ((b.softness ?? 0)|0) &&
          a.color === b.color;
 };
 
@@ -19,13 +19,12 @@ class Typography extends Component {
   createNode() { return this.runtime.host.createTextNode(this); }
 
   diff(prev = {}, next = {}) {
-    // 1) Text-related props (host.setTextProps) — triggers layout/geometry rebuild when needed
+    // 1) Text-related props (host.setTextProps)
     const textChanged =
       prev.text !== next.text ||
       prev.fontName !== next.fontName ||
       prev.fontSize !== next.fontSize ||
       prev.truncateWidth !== next.truncateWidth ||
-      prev.softnessPx !== next.softnessPx ||
       prev.color !== next.color ||
       !sameShadow(prev.shadow, next.shadow);
 
@@ -37,9 +36,13 @@ class Typography extends Component {
           text: next.text ?? '',
           fontSize: next.fontSize == null ? 16 : next.fontSize,
           color: next.color ?? '#ffffff',
-          shadow: next.shadow || null,           // { dx, dy, color, softnessPx } or null
+          shadow: next.shadow ? {
+            dx: next.shadow.dx ?? 1,
+            dy: next.shadow.dy ?? 1,
+            color: next.shadow.color ?? '#000000',
+            softness: next.shadow.softness ?? 0,
+          } : null,                               // { dx, dy, color, softness } or null
           truncateWidth: Number.isFinite(next.truncateWidth) ? next.truncateWidth : Infinity,
-          softnessPx: next.softnessPx == null ? 0 : next.softnessPx,
         },
         { key: `${this._createdAt}:textprops` }
       );

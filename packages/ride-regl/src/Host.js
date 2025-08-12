@@ -66,8 +66,9 @@ class Host {
   async init() {
     this.regl = createREGL({
       canvas: this.canvas,
-      attributes: { alpha: true, antialias: false, premultipliedAlpha: true },
-      extensions: ['OES_standard_derivatives'], // WebGL1: for fwidth/dFdx/dFdy
+      attributes: { alpha: true, antialias: true, premultipliedAlpha: true },
+      // WebGL1: derivatives for fwidth/dFdx/dFdy
+      extensions: ['OES_standard_derivatives'],
     });
 
     // scene root
@@ -133,7 +134,7 @@ class Host {
       scissor: { enable: this.regl.prop('scissorEnabled'), box: this.regl.prop('scissorBox') },
     });
 
-    // —— MSDF TEXT pipeline (WebGL1) ————————————————————————————————
+    // —— MSDF TEXT pipeline (WebGL1, improved AA) ————————————————————
     const textVert = `
       precision mediump float;
       attribute vec2 aPosPx;   // local vertex in DEVICE px (y down)
@@ -158,18 +159,35 @@ class Host {
     // NOTE: the extension pragma MUST be the very first line.
     const textFrag = `
 #extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 uniform sampler2D uAtlas;
 uniform vec4 uColor;
-uniform float uSoft;
+uniform float uSoft;      // extra blur factor (0 = sharp)
 varying vec2 vUV;
+
 float median3(vec3 v){ return max(min(v.r,v.g), min(max(v.r,v.g), v.b)); }
+
 void main() {
   vec3 msdf = texture2D(uAtlas, vUV).rgb;
+
+  // Signed distance in MSDF's domain (0.5 = edge)
   float sd = median3(msdf) - 0.5;
-  float w = fwidth(sd) + 0.0001 + uSoft*0.01;
-  float a = smoothstep(-w, w, sd);
-  gl_FragColor = vec4(uColor.rgb, uColor.a * a);
+
+  // AA width from per-channel gradients (screen-space)
+  vec3 w3 = fwidth(msdf);
+  float w = max(median3(w3), 1e-6);
+
+  // Optional softness widening (unitless factor)
+  w *= (1.0 + max(uSoft, 0.0));
+
+  // Linear coverage (avoids halos); use smoothstep(-w,w,sd) if you prefer
+  float alpha = clamp(sd / w + 0.5, 0.0, 1.0);
+
+  gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
 }
     `;
 
@@ -213,10 +231,16 @@ void main() {
       });
       // re-init pipeline
       this.init().then(() => {
-        // re-upload MSDF atlas textures from saved imageData
+        // re-upload MSDF atlas textures from saved imageData (with filtering)
         this.msdf.fonts.forEach((f) => {
           try { f.atlasTex?.forEach(tex => tex.destroy?.()); } catch {}
-          f.atlasTex = f.imageData.map(img => this.regl.texture({ data: img, flipY: true }));
+          const makeTex = (img) => this.regl.texture({
+            data: img, flipY: true,
+            min: 'linear', mag: 'linear',
+            wrapS: 'clamp', wrapT: 'clamp',
+            mipmap: false,
+          });
+          f.atlasTex = f.imageData.map(makeTex);
         });
         // re-upload sprite textures
         this.nodes.forEach(n => { if (n._lastSource) this.setTexture(n, n._lastSource); });
@@ -252,22 +276,31 @@ void main() {
   // Usage 1: await host.registerFont('Inter', { fontUrl: '/fonts/Inter-Regular.fnt' })
   // Usage 2 (legacy): host.registerFont('Inter', { imageData: ImageBitmap|ImageBitmap[], fontData: {...} })
   async registerFont(fontName, opts) {
+    const makeTex = (img) => this.regl.texture({
+      data: img,
+      flipY: true,
+      min: 'linear', mag: 'linear',
+      wrapS: 'clamp', wrapT: 'clamp',
+      mipmap: false,
+    });
+
     if (opts.fontUrl) {
       // Load JSON
       const fontUrl = opts.fontUrl.trim();
       const base = new URL(fontUrl, window.location.href);
       const fontData = await fetch(base).then(r => r.json());
 
-      // Pages list (fontbm puts them in fontData.pages)
+      // Pages list (fontbm: fontData.pages array of filenames)
       let pageNames = [];
       if (Array.isArray(fontData.pages) && fontData.pages.length > 0) {
         pageNames = fontData.pages;
       } else if (Array.isArray(fontData.page) && fontData.page.length > 0) {
-        pageNames = fontData.page; // rare alt
+        pageNames = fontData.page; // rare alt key
       } else {
-        // best effort: derive Inter-Regular_0.png next to .fnt
+        // derive `<stem>_0.png` next to .fnt
         const stem = base.pathname.replace(/\.[^.]+$/, '');
-        pageNames = [stem.split('/').pop() + '_0.png'];
+        const file = stem.split('/').pop() + '.png';
+        pageNames = [file];
       }
 
       // Fetch all pages as ImageBitmap[]
@@ -277,10 +310,10 @@ void main() {
         return await createImageBitmap(blob);
       }));
 
-      // Build textures
-      const atlasTex = imageData.map(img => this.regl.texture({ data: img, flipY: true }));
+      // Build textures (with proper filtering, no mipmaps)
+      const atlasTex = imageData.map(makeTex);
 
-      // Parse metrics (same as manual path)
+      // Parse metrics
       const common = fontData.common || {};
       const info   = fontData.info || {};
       const atlasW = common.scaleW, atlasH = common.scaleH;
@@ -312,7 +345,7 @@ void main() {
     // Legacy/manual path (already have images + JSON)
     const fontData = opts.fontData;
     const imgs = Array.isArray(opts.imageData) ? opts.imageData : [opts.imageData];
-    const atlasTex = imgs.map(img => this.regl.texture({ data: img, flipY: true }));
+    const atlasTex = imgs.map(makeTex);
 
     const common = fontData.common || {};
     const info   = fontData.info || {};
@@ -357,9 +390,8 @@ void main() {
       text: '',
       fontSize: 16,
       color: [1,1,1,1],     // can be '#rrggbb[aa]'
-      shadow: null,         // { dx, dy, color, softnessPx }
+      shadow: null,         // { dx, dy, color, softness }
       truncateWidth: Infinity,
-      softnessPx: 0,
     };
     node._geom = null;
     return node;
@@ -387,6 +419,7 @@ void main() {
   setProps(node, patch) { Object.assign(node.props, patch); }
   setTextProps(node, patch) {
     Object.assign(node.text, patch);
+    // rebuild geometry if content/metrics changed
     if ('text' in patch || 'fontName' in patch || 'fontSize' in patch || 'truncateWidth' in patch) {
       if (node._geom?.pages) {
         try { node._geom.pages.forEach(pg => pg.aPosPx?.destroy?.()); } catch {}
@@ -512,10 +545,10 @@ void main() {
       const y0css = basePx + g.yoff * scale; // top-left of glyph box from line top
       const wcss = g.w * scale, hcss = g.h * scale;
 
-      const x0 = Math.round(x0css * dpr);
-      const y0 = Math.round(y0css * dpr);
-      const x1 = Math.round((x0css + wcss) * dpr);
-      const y1 = Math.round((y0css + hcss) * dpr);
+      const x0 = x0css * dpr;
+      const y0 = y0css * dpr;
+      const x1 = (x0css + wcss) * dpr;
+      const y1 = (y0css + hcss) * dpr;
 
       const u0 = (g.x) / atlasW, v0 = (g.y) / atlasH;
       const u1 = (g.x + g.w) / atlasW, v1 = (g.y + g.h) / atlasH;
@@ -685,13 +718,12 @@ void main() {
             if (sw>0 && sh>0) scissorEnabled = true, scissorBox = { x:sx, y:sy, width:sw, height:sh };
           }
 
-          const color = this._parseColor(t.color);
+          const mainColor = this._parseColor(t.color);
           const baseUniforms = {
             uTranslatePx: toDevice(pivotX, pivotY, 0, 0).slice(0,2),
             uTextSizePx: G.sizeDev,
             uAnchor: p.anchor || [0,0],
             uRotation: totalRotation,
-            uSoft: t.softnessPx || 0,
             scissorEnabled, scissorBox,
           };
 
@@ -699,31 +731,33 @@ void main() {
           for (const pg of G.pages) {
             const uniformsCommon = {
               ...baseUniforms,
+              aPosPx: pg.aPosPx,
+              aUV: pg.aUV,
+              count: pg.count,
               uAtlas: font.atlasTex[pg.page] || font.atlasTex[0],
             };
 
             // shadow pass
             if (t.shadow) {
-              const { dx=1, dy=1, color: sc='#000000', softnessPx=1 } = t.shadow;
+              const dx = t.shadow.dx ?? 1;
+              const dy = t.shadow.dy ?? 1;
+              const soft = Math.max(0, t.shadow.softness ?? 0);
+              const shadowColor = this._parseColor(t.shadow.color ?? '#000000');
               const [tx, ty] = toDevice(dx, dy, 0, 0);
+
               this.drawTextMSDF({
                 ...uniformsCommon,
-                aPosPx: pg.aPosPx,
-                aUV: pg.aUV,
-                count: pg.count,
                 uTranslatePx: [ uniformsCommon.uTranslatePx[0] + tx, uniformsCommon.uTranslatePx[1] + ty ],
-                uColor: this._parseColor(sc),
-                uSoft: softnessPx,
+                uColor: shadowColor,
+                uSoft: soft,
               });
             }
 
-            // main pass
+            // main pass (no extra softness)
             this.drawTextMSDF({
               ...uniformsCommon,
-              aPosPx: pg.aPosPx,
-              aUV: pg.aUV,
-              count: pg.count,
-              uColor: [color[0], color[1], color[2], color[3] * a], // parent alpha
+              uColor: [mainColor[0], mainColor[1], mainColor[2], mainColor[3] * a], // parent alpha
+              uSoft: 0.0,
             });
           }
         }
