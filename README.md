@@ -1,5 +1,3 @@
- Ride
-
 # Ride
 
 ![Ride](https://pub-464e6b9480014239a02034726cf0073c.r2.dev/ride.jpg)
@@ -9,7 +7,7 @@ Tiny, host-agnostic orchestration runtime for **data** → **op** → **effect**
 Ride gives you a `Component` base, a batched `Scheduler`, and a single-entry `Op × Effect` API. It knows nothing about Pixi/DOM/Canvas — you plug in a host adapter (e.g., Pixi v8) and write components that **enqueue ops**, not re-renders.
 
 > ### 🚀 Looking for a WebGL host + components?
-> Use Ride with WebGL via **ride-regl** → **[packages/ride-regl/README.md »](./packages/ride-regl/README.md)**
+> Use Ride with WebGL via **ride-regl** → **[packages/ride-regl/README.md](./packages/ride-regl/README.md)**
 
 ---
 

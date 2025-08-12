@@ -1,4 +1,3 @@
-// packages/ride-regl/components/Scene.js
 import { Component } from '@lockvoid/ride';
 import { GeometryBehavior, EventsBehavior } from '../behaviors';
 

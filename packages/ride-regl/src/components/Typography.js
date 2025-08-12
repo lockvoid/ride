@@ -1,4 +1,3 @@
-// packages/ride-regl/components/Typography.js
 import { Component } from '@lockvoid/ride';
 import { same } from '@lockvoid/ride/utils';
 import { GeometryBehavior, EventsBehavior } from '../behaviors';

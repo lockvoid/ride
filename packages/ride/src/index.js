@@ -1,4 +1,3 @@
-// core.js
 // Renderer-agnostic microframework core
 // - Pre-ready diff buffering (diff() can queue ops before host-ready; no commit)
 // - Progressive frame budget: App.progressive = { budget: ms }

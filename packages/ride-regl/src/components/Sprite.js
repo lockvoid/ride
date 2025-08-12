@@ -1,4 +1,3 @@
-// packages/ride-regl/components/Sprite.js
 import { Component } from '@lockvoid/ride';
 import { GeometryBehavior, EventsBehavior } from '../behaviors';
 
