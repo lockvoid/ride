@@ -1117,4 +1117,196 @@ describe('Ride', () => {
       spy.mockRestore();
     }
   });
+
+  describe('Behaviors', () => {
+    let log;
+    beforeEach(() => { log = []; });
+
+    const A = {
+      name: 'A',
+      effect(op, ctx) {
+        log.push(`A:${op.type}`);
+        return () => log.push('cA');
+      },
+    };
+
+    const B = {
+      name: 'B',
+      effect(op, ctx) {
+        log.push(`B:${op.type}`);
+        return () => log.push('cB');
+      },
+    };
+
+    it('runs behaviors base→derived, aggregates cleanups reverse order, then legacy effect', async () => {
+      class Scene extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [A];
+        effect(op) {
+          log.push(`LEG:${op.type}`);
+          return () => log.push('cLEG');
+        }
+      }
+      class AssetGrid extends Scene {
+        static behaviors = [B]; // no need to spread super
+      }
+
+      const app = Ride.mount(AssetGrid, {});
+      await raf(); await Ride.flushUntilIdle(app); // init
+
+      // queue op with a key
+      app.queue('draw', { n: 1 }, { key: 'k' });
+      await raf(); await Ride.flushUntilIdle(app);
+      expect(log).toEqual(['A:draw', 'B:draw', 'LEG:draw']);
+
+      // replacement for same key triggers cleanup: cLEG, cB, cA (reverse)
+      app.queue('draw', { n: 2 }, { key: 'k' });
+      await raf(); await Ride.flushUntilIdle(app);
+      expect(log).toEqual([
+        'A:draw', 'B:draw', 'LEG:draw',
+        'cLEG', 'cB', 'cA',
+        'A:draw', 'B:draw', 'LEG:draw',
+      ]);
+    });
+
+    it('filters by types and custom matches', async () => {
+      const TypeOnly = { name: 'TypeOnly', types: ['resize'], effect: (op) => log.push('TypeOnly') };
+      const Matcher = { name: 'Matcher', matches: (op) => !!op.payload?.hit, effect: (op) => log.push('Matcher') };
+
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [TypeOnly, Matcher];
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+
+      app.queue('camera', {}, { key: 'k1' });
+      app.queue('resize', {}, { key: 'k2' });
+      app.queue('foo', { hit: true }, { key: 'k3' });
+
+      await raf(); await Ride.flushUntilIdle(app);
+
+      // camera: none; resize: TypeOnly; foo(hit): Matcher
+      expect(log).toEqual(['TypeOnly', 'Matcher']);
+    });
+
+    it('behavior init can register lifetime cleanups that run on unmount', async () => {
+      const InitC = {
+        name: 'InitC',
+        init(ctx) {
+          log.push('initC');
+          return () => log.push('initC-cleanup');
+        },
+        effect(op) { log.push('run'); },
+      };
+
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [InitC];
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+      expect(log[0]).toBe('initC');
+
+      app.queue('x', {}, { key: 'x' });
+      await raf(); await Ride.flushUntilIdle(app);
+      expect(log).toContain('run');
+
+      await Ride.unmount(app);
+      expect(log).toContain('initC-cleanup');
+    });
+
+    it('behavior diff can queue ops and force defer', async () => {
+      const DiffB = {
+        name: 'DiffB',
+        diff(prev, next, ctx) {
+          // queue an op and request defer so props aren't committed yet this turn
+          this.queue('tick', { i: (next.i ?? 0) }, { key: 't' });
+          ctx.defer();
+          return DIFF.DEFER;
+        },
+        effect(op) { log.push(`tick:${op.payload.i}`); },
+      };
+
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [DiffB];
+        diff(prev, next) {
+          // legacy diff (should still run, but defer wins)
+        }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+
+      app.update({ i: 1 });
+      await raf(); await Ride.flushUntilIdle(app);
+
+      expect(log).toEqual(['tick:1']);
+    });
+
+    it('routes behavior errors via onError and continues', async () => {
+      const onError = vi.fn();
+
+      const Bad = {
+        name: 'Bad',
+        effect() { throw new Error('bad behavior'); },
+      };
+
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [Bad];
+        static onError = onError;
+        effect(op) { log.push('ok'); } // should still run after Bad fails
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+
+      app.queue('z', {}, { key: 'z' });
+      await raf(); await Ride.flushUntilIdle(app);
+
+      expect(onError).toHaveBeenCalled();
+      const [err, ctx] = onError.mock.calls[0];
+      expect(err.message).toBe('bad behavior');
+      expect(ctx.phase).toBe('effect');
+      expect(log).toEqual(['ok']);
+    });
+
+    it('aggregates multiple behavior cleanups for same key (reverse order) and reports cleanup errors', async () => {
+      const onError = vi.fn();
+
+      const C1 = { name: 'C1', effect(op) { log.push('C1'); return () => log.push('c1'); } };
+      const C2 = { name: 'C2', effect(op) { log.push('C2'); return async () => { log.push('c2-start'); await delay(1); log.push('c2-done'); }; } };
+      const C3 = { name: 'C3', effect(op) { log.push('C3'); return () => { log.push('c3!'); throw new Error('boom-clean'); }; } };
+
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        static behaviors = [C1, C2, C3];
+        static onError = onError;
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+
+      app.queue('work', {}, { key: 'k' });
+      await raf(); await Ride.flushUntilIdle(app);
+      expect(log.slice(0,3)).toEqual(['C1','C2','C3']);
+
+      app.queue('work', {}, { key: 'k' }); // replacement -> cleanup chain before next effects
+      await raf(); await Ride.flushUntilIdle(app);
+
+      // Reverse: c3 throws, then c2 async, then c1
+      expect(log).toEqual([
+        'C1','C2','C3',
+        'c3!', 'c2-start', 'c2-done', 'c1',
+        'C1','C2','C3',
+      ]);
+      expect(onError).toHaveBeenCalled();
+      const [, ctx] = onError.mock.calls[0];
+      expect(ctx.phase).toBe('cleanup');
+    });
+  });
 });

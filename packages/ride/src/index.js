@@ -5,16 +5,13 @@
 // - Per-component priority: Component.progressive = { priority: number } (0 = highest)
 // - Effective op priority = componentPriority + opPriority
 // - @ride/init priority = componentPriority - 1 (runs first within component)
-// - Single-queue snapshot drain; ops queued during drain run next RAF
+// - Single-queue snapshot drain; ops queued during effect() land in the live buffer for NEXT RAF
 // - Scheduler batch order: depth -> componentPriority -> creationOrder
 // - No RAF scheduled while not ready (keeps buffers inspectable in tests)
 // - effect(op) may return a cleanup fn; it runs before the next effect of the same key and on unmount.
 // - Deterministic testing: Scheduler.whenIdle() + Ride.flushUntilIdle(app)
 // - Error surface: route errors to App.onError?.(err, { component, op, phase })
-
-/* ============================================================================
- * Constants
- * ==========================================================================*/
+// - Behaviors/traits: classes declare `static behaviors = [...]` (merged base→derived automatically)
 
 export const PRIORITY = Object.freeze({
   HIGHEST: 0,
@@ -122,7 +119,7 @@ class CommandBuffer {
 }
 
 /* ============================================================================
- * Scheduler (RAF + budget) with in-flight tracking
+ * Scheduler (RAF + budget) with in-flight tracking & depth-gated yielding
  * ==========================================================================*/
 
 class Scheduler {
@@ -178,6 +175,15 @@ class Scheduler {
       );
       this.dirty.clear();
 
+      // Depth group gating: don't split siblings at the same depth
+      let groupDepth = batch.length ? (batch[0]._depth | 0) : null;
+      const shouldYieldBetweenComponents = (nextDepth) => {
+        // If still within same depth group, ignore budget pressure
+        if (groupDepth != null && nextDepth === groupDepth) return false;
+        // Crossing into a new depth? now we can consider yielding
+        return shouldYield();
+      };
+
       // If any not ready, keep them dirty and do nothing this frame
       const anyNotReady = batch.some(c => !c.runtime.isReady);
       if (anyNotReady) {
@@ -200,7 +206,7 @@ class Scheduler {
           continue;
         }
 
-        // Drain this component once per frame
+        // Drain this component once per frame (op-level shouldYield is still allowed)
         if (component._cmds.size > 0) {
           const drained = await component._cmds.drain(
             component._effect.bind(component),
@@ -211,9 +217,9 @@ class Scheduler {
 
         // Initial commit (after possible pre-ready diffs)
         if (!component._hasInitialized) {
-          if (shouldYield()) {
+          // Do not split siblings at same depth group
+          if (shouldYieldBetweenComponents(component._depth | 0)) {
             this.dirty.add(component);
-            // Requeue remaining components in this batch for next RAF
             for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
             break;
           }
@@ -230,10 +236,15 @@ class Scheduler {
 
         if (component.runtime?.host) hosts.add(component.runtime.host);
 
-        if (shouldYield()) {
-          // Requeue remaining components in this batch for next RAF
-          for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
-          break;
+        // End of component: update groupDepth and maybe yield *between* components
+        const nextDepth = (i + 1) < batch.length ? (batch[i + 1]._depth | 0) : (groupDepth == null ? null : groupDepth + 1);
+        if (nextDepth !== null && nextDepth !== groupDepth) {
+          // we're about to enter a deeper (or different) depth group
+          if (shouldYieldBetweenComponents(nextDepth)) {
+            for (let j = i + 1; j < batch.length; j++) this.dirty.add(batch[j]);
+            break;
+          }
+          groupDepth = nextDepth; // advance group
         }
       }
 
@@ -261,22 +272,10 @@ class Scheduler {
    */
   async whenIdle({ max = 100 } = {}) {
     for (let i = 0; i < max; i++) {
-      // If a flush is in progress, await it.
       if (this._inFlight) await this._inFlight;
-
-      // If a flush is scheduled (next rAF) but not started, run it now.
-      if (this.scheduled) {
-        await this.flush();
-        continue;
-      }
-
-      // If there is work but not scheduled, flush now.
-      if (this.dirty.size) {
-        await this.flush();
-        continue;
-      }
-
-      return; // idle
+      if (this.scheduled) { await this.flush(); continue; }
+      if (this.dirty.size) { await this.flush(); continue; }
+      return;
     }
     throw new Error('Scheduler.whenIdle(): exceeded max iterations');
   }
@@ -309,8 +308,7 @@ class Runtime {
       let handler = app?.constructor?.onError || app?.onError;
       let receiver = app;
 
-      // If app isn't set yet (e.g., errors during App constructor/diff),
-      // fall back to the component that raised the error.
+      // Fallback to component-level handlers if app not ready yet
       if (typeof handler !== 'function') {
         const comp = ctx?.component;
         handler = comp?.constructor?.onError || comp?.onError;
@@ -329,10 +327,29 @@ class Runtime {
 }
 
 /* ============================================================================
- * Component
+ * Component (with behaviors)
  * ==========================================================================*/
 
 export class Component {
+  // Local-only behaviors; base → derived merged automatically at runtime
+  static behaviors = Object.freeze([]);
+
+  // Optional plugin sugar
+  static use(...bs) {
+    const cur = this.behaviors || [];
+    this.behaviors = Object.freeze([...cur, ...bs]);
+  }
+
+  // Merge behaviors along prototype chain (base first, then derived)
+  static _collectBehaviors() {
+    const out = [];
+    for (let C = this; C && C !== Component; C = Object.getPrototypeOf(C)) {
+      const list = C.behaviors || C.behaviours || [];
+      if (list && list.length) out.unshift(...list);
+    }
+    return Object.freeze(out);
+  }
+
   constructor(props, context, runtime, parent = null) {
     // Refs
     this.runtime = runtime;
@@ -365,9 +382,13 @@ export class Component {
     // Node
     this.node = null;
 
-    // Cleanups (per-op key) and optional init cleanup
-    this._cleanups = new Map(); // key -> () => (void|Promise)
-    this._initCleanup = null;
+    // Cleanups
+    this._cleanups = new Map();     // key -> () => (void|Promise)
+    this._initCleanup = null;       // legacy init cleanup
+    this._lifetimeCleanups = [];    // behavior init cleanups (component lifetime)
+
+    // Behaviors
+    this._behaviors = this.constructor._collectBehaviors();
 
     // Ready promise (host + parent)
     this._setupReadyPromise();
@@ -405,6 +426,26 @@ export class Component {
     this._stagedProps = null;
   }
 
+  _makeCtx({ phase, op, collectCleanupsRef, deferFlagRef } = {}) {
+    const component = this;
+    const onError = (err, ph = phase, extra) =>
+      this.runtime.reportError(err, { component, op: op ?? null, phase: ph, ...extra });
+
+    const addCleanup = (fn) => {
+      if (typeof fn !== 'function') return;
+      if (phase === 'effect' && collectCleanupsRef) {
+        collectCleanupsRef.push(fn);
+      } else {
+        // treat as lifetime cleanup (e.g., behavior init)
+        this._lifetimeCleanups.push(fn);
+      }
+    };
+
+    const defer = () => { if (deferFlagRef) deferFlagRef.value = true; };
+
+    return { component, addCleanup, defer, onError };
+  }
+
   async _runInitialDiff() {
     if (!this._needsInitialDiff) return;
 
@@ -422,34 +463,76 @@ export class Component {
     }
 
     this._needsInitialDiff = false;
-       this._hasInitialized = true;
+    this._hasInitialized = true;
 
     if (this._cmds.size) this.runtime.scheduler.markDirty(this);
   }
 
   async _runDiff(prev, next) {
     const ticket = ++this._diffTicket;
+
+    // Behaviors can force defer
+    const deferFlagRef = { value: false };
+    if (this._behaviors.length) {
+      const ctx = this._makeCtx({ phase: 'diff', deferFlagRef });
+      for (const b of this._behaviors) {
+        if (!b?.diff) continue;
+        try {
+          let r = b.diff.call(this, prev, next, ctx);
+          if (r && typeof r.then === 'function') r = await r;
+          if (r === DIFF.DEFER) deferFlagRef.value = true;
+        } catch (err) {
+          this.runtime.reportError(err, { component: this, op: null, phase: 'diff' });
+          deferFlagRef.value = true;
+        }
+      }
+    }
+
     let result;
-    try {
-      result = this.diff(prev, next);
-    } catch (err) {
-      this.runtime.reportError(err, { component: this, op: null, phase: 'diff' });
-      return DIFF.DEFER;
+    try { result = this.diff(prev, next); }
+    catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'diff' }); deferFlagRef.value = true; }
+    if (result && typeof result.then === 'function') {
+      try { result = await result; }
+      catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'diff' }); deferFlagRef.value = true; }
     }
-    try {
-      if (result && typeof result.then === 'function') result = await result;
-    } catch (err) {
-      this.runtime.reportError(err, { component: this, op: null, phase: 'diff' });
-      return DIFF.DEFER;
-    }
+
     if (ticket !== this._diffTicket) return DIFF.DEFER; // stale
+    if (deferFlagRef.value || result === DIFF.DEFER) return DIFF.DEFER;
+    return DIFF.COMMIT;
+  }
+
+  // Pre-ready diff path: skip behaviors to avoid spurious first-render effects
+  async _runDiffPreReady(prev, next) {
+    const ticket = ++this._diffTicket;
+    let result;
+    try { result = this.diff(prev, next); }
+    catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'diff' }); return DIFF.DEFER; }
+    if (result && typeof result.then === 'function') {
+      try { result = await result; }
+      catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'diff' }); return DIFF.DEFER; }
+    }
+    if (ticket !== this._diffTicket) return DIFF.DEFER;
     return result === DIFF.DEFER ? DIFF.DEFER : DIFF.COMMIT;
   }
 
-  // Swallow internals; forward user ops to effect()
+  // Swallow internals; forward user ops to behaviors + legacy effect()
   async _effect(op) {
     if (op.type === '@ride/init') {
       if (!this._initDone) {
+        // Behavior init (can register lifetime cleanups)
+        try {
+          const ctx = this._makeCtx({ phase: 'init' });
+          for (const b of this._behaviors) {
+            if (!b?.init) continue;
+            const r = b.init.call(this, ctx);
+            const res = (r && typeof r.then === 'function') ? await r : r;
+            if (typeof res === 'function') this._lifetimeCleanups.push(res);
+          }
+        } catch (err) {
+          this.runtime.reportError(err, { component: this, op, phase: 'init' });
+        }
+
+        // Legacy user init
         try {
           const maybe = this.init();
           const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
@@ -457,6 +540,7 @@ export class Component {
         } catch (err) {
           this.runtime.reportError(err, { component: this, op, phase: 'init' });
         }
+
         this._initDone = true;
       }
       return; // swallowed
@@ -467,27 +551,54 @@ export class Component {
     const prevCleanup = key != null ? this._cleanups.get(key) : null;
     if (prevCleanup) {
       try {
-        await prevCleanup();
+        const r = prevCleanup();
+        if (r && typeof r.then === 'function') await r;
+      }
+      catch (err) { this.runtime.reportError(err, { component: this, op, phase: 'cleanup' }); }
+      finally { this._cleanups.delete(key); }
+    }
+
+    const collected = [];
+    const ctx = this._makeCtx({ phase: 'effect', op, collectCleanupsRef: collected });
+
+    // Behaviors first (base → derived), with optional filters
+    for (const b of this._behaviors) {
+      const matchesType = !b?.types || (Array.isArray(b.types) && b.types.includes(op.type));
+      const matches = typeof b?.matches === 'function' ? !!b.matches(op) : true;
+      if (!b?.effect || !matchesType || !matches) continue;
+      try {
+        let r = b.effect.call(this, op, ctx);
+        if (r && typeof r.then === 'function') r = await r;
+        if (typeof r === 'function') collected.push(r);
       } catch (err) {
-        this.runtime.reportError(err, { component: this, op, phase: 'cleanup' });
-      } finally {
-        this._cleanups.delete(key);
+        this.runtime.reportError(err, { component: this, op, phase: 'effect' });
       }
     }
 
+    // Legacy effect last
     if (typeof this.effect === 'function') {
-      let res;
       try {
-        const maybe = this.effect(op);
-        res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+        let r = this.effect(op);
+        if (r && typeof r.then === 'function') r = await r;
+        if (typeof r === 'function') collected.push(r);
       } catch (err) {
         this.runtime.reportError(err, { component: this, op, phase: 'effect' });
-        return;
       }
+    }
 
-      if (typeof res === 'function' && key != null) {
-        this._cleanups.set(key, res);
-      }
+    // Combine multiple cleanups into one (reverse order) and ensure we await thenables
+    if (collected.length && key != null) {
+      const combined = async () => {
+        for (let i = collected.length - 1; i >= 0; i--) {
+          try {
+            const res = collected[i]();
+            if (res && typeof res.then === 'function') await res;
+          } catch (err) {
+            this.runtime.reportError(err, { component: this, op, phase: 'cleanup' });
+          }
+        }
+      };
+      this._cleanups.set(key, combined);
     }
   }
 
@@ -517,19 +628,15 @@ export class Component {
   async _processUpdate(prev, next) {
     const result = await this._runDiff(prev, next);
     if (this._destroyed) return;
-    if (result !== DIFF.DEFER) {
-      this._commit(next);
-    }
-    if (this.runtime.isReady && this._cmds.size) {
-      this.runtime.scheduler.markDirty(this);
-    }
+    if (result !== DIFF.DEFER) this._commit(next);
+    if (this.runtime.isReady && this._cmds.size) this.runtime.scheduler.markDirty(this);
   }
 
   async _processUpdatePreReady(prev, next) {
-    await this._runDiff(prev, next);   // queue ops; do not commit
+    // IMPORTANT: during pre-ready we do *not* run behavior diffs (skip spurious effects)
+    await this._runDiffPreReady(prev, next);   // queue ops; do not commit
     this._preReadyDiffRan = true;
-    // IMPORTANT: do NOT schedule RAF while not ready — keep buffers stable.
-    // First RAF will be scheduled when the host becomes ready.
+    // No scheduling while not ready — first RAF will be scheduled when the host becomes ready.
   }
 
   queue(type, payload, opts = {}) {
@@ -574,13 +681,34 @@ export class Component {
 
     // Run all per-key cleanups
     for (const [, fn] of this._cleanups) {
-      try { await fn(); } catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' }); }
+      try {
+        const r = fn();
+        if (r && typeof r.then === 'function') await r;
+      } catch (err) {
+        this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' });
+      }
     }
     this._cleanups.clear();
 
-    // Run init-scope cleanup last
+    // Run behavior lifetime cleanups (reverse)
+    for (let i = this._lifetimeCleanups.length - 1; i >= 0; i--) {
+      try {
+        const r = this._lifetimeCleanups[i]();
+        if (r && typeof r.then === 'function') await r;
+      } catch (err) {
+        this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' });
+      }
+    }
+    this._lifetimeCleanups.length = 0;
+
+    // Run legacy init-scope cleanup last
     if (typeof this._initCleanup === 'function') {
-      try { await this._initCleanup(); } catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' }); }
+      try {
+        const r = this._initCleanup();
+        if (r && typeof r.then === 'function') await r;
+      } catch (err) {
+        this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' });
+      }
       this._initCleanup = null;
     }
 
@@ -603,9 +731,7 @@ export class Component {
       priority: (this._componentPriority | 0) - 1, // runs before any user op of this component
       squashWith: (prev) => prev,
     });
-    if (this.runtime.isReady) {
-      this.runtime.scheduler.markDirty(this);
-    }
+    if (this.runtime.isReady) this.runtime.scheduler.markDirty(this);
   }
 
   /* ===== Override points ===== */
