@@ -1,6 +1,7 @@
+
 # Ride
 
-Tiny, renderer-agnostic UI runtime for **data → ops → single-frame commits**.
+Tiny, host-agnostic orchestration runtime for **data** → **ops** → **effect**.
 
 Ride gives you a `Component` base, a batched `Scheduler`, and a single-entry `effect(op)` API. It knows nothing about Pixi/DOM/Canvas — you plug in a host adapter (e.g., Pixi v8) and write components that **enqueue ops**, not re-renders.
 
@@ -15,7 +16,12 @@ Ride gives you a `Component` base, a batched `Scheduler`, and a single-entry `ef
 - **Squashing.** Combine multiple ops for the same key with `squashWith(prev, next, prevOp, nextOp)`.
 - **Child slotting.** `getChildParent(child)` lets a parent choose **where** children attach.
 - **Progressive scheduling.** `static progressive = { budget }` time-slices work per frame to avoid hitches.
-- **Host API rename.** `attach`/`detach` → `attachNode`/`detachNode`.
+- **Behaviors (traits).** Declare `static behaviors = [...]` on your class to compose capabilities without inheritance gymnastics. Behaviors can hook into `init`, `diff`, and `effect` (with filtering), and they can return cleanups.
+- **Effect & init cleanups.** `effect(op)` may return a cleanup that runs **before the next effect for the same key** and again on unmount. `init()` may return a **lifetime cleanup** that runs on unmount.
+- **Deterministic flushing.** `Ride.flushUntilIdle(app)` awaits all scheduled/in-flight work. Great for tests.
+- **Error surface.** Errors in `attach/init/diff/effect/cleanup/host-init` are routed to `App.onError(err, ctx)` (or static `App.onError`) and won’t wedge a frame.
+- **Depth-gated budgeting.** Under a tight frame budget, Ride slices between **depth groups** so siblings at the same depth finish together before yielding.
+- **Utils** A micro helper for declarative “did this change?” checks, shared by behaviors.
 
 ---
 
@@ -270,7 +276,7 @@ app.update({ todos: [{ id: 1, text: 'Buy milk' }] });
 
 ```js
 class MyComponent extends Component {
-  static progressive = { budget: 8 }; // max ops/frame
+  static progressive = { budget: 8 }; // max ms/frame
 }
 ```
 
@@ -370,9 +376,274 @@ _reconcileWindow(){
 }
 ```
 
+
+---
+
+## Behaviors (traits)
+
+Behaviors are small objects you compose into components. They run **before** your component’s own `diff/effect`, in **base → derived** order, and can be filtered by op type or a custom predicate.
+
+### Declare
+
+```js
+export class Scene extends Component {
+  static behaviors = [CameraBehavior, InputBehavior]; // local to Scene
+}
+
+export class AssetGrid extends Scene {
+  static behaviors = [SelectionBehavior]; // local to AssetGrid only
+}
+```
+
+You can also do plugin-style composition:
+
+```js
+AssetGrid.use(MetricsBehavior); // optional sugar, mostly for plugins/tests
+```
+
+### Behavior shape
+
+```ts
+type Behavior = {
+  name?: string;                   // for debugging
+  types?: string[];                // handle only these op types
+  matches?: (op) => boolean;       // custom filter
+
+  init?: (ctx) => void | (() => void) | Promise<void | (() => void)>;
+  diff?: (prev, next, ctx) => void | DIFF | Promise<void | DIFF>;
+  effect?: (op, ctx) => void | (() => void) | Promise<void | (() => void)>;
+};
+```
+
+### Context passed to hooks
+
+```ts
+type Ctx = {
+  component: Component;
+  addCleanup(fn: () => (void|Promise<void>)): void;  // lifetime (init) or per-key (effect)
+  defer(): void;                                      // diff: force DIFF.DEFER
+  onError(err: any, phase?: string, extra?: any): void;
+};
+```
+
+### Ordering & filtering
+
+- **Order:** base class behaviors first, then subclass behaviors, then your component’s own `effect()`.
+- **Filter:** set `types: [...]` and/or `matches(op)` to opt behaviors into certain ops only.
+
+### Pre-ready rule
+
+While the host is not ready, Ride buffers ops but **skips behavior diffs** (to avoid first-render side-effects). Legacy `diff()` still runs so you can stage ops.
+
+---
+
+## Cleanups
+
+- **Per-key cleanups** — return a function from `effect(op)`.
+  Runs:
+  1) **Before** the next `effect()` for the **same key** (awaited), and
+  2) Again on **unmount** if still registered.
+
+- **Lifetime cleanups** — return a function from `init()` **or** call `ctx.addCleanup(fn)` inside a behavior’s `init`.
+  Runs on **unmount**, after all per-key cleanups.
+
+- **Aggregation & order:** Multiple behaviors can return cleanups for the **same key**. Ride combines them and executes in **reverse order** of registration (LIFO), awaiting async cleanups:
+
+```
+effect chain: [A, B, Legacy]  → cleanup order: [Legacy, B, A]
+```
+
+---
+
+## Deterministic flushing (tests & tools)
+
+After a `requestAnimationFrame`, work may still be in-flight (async effects/cleanups). For stable tests:
+
+```js
+await raf();
+await Ride.flushUntilIdle(app); // guarantees all scheduled/in-flight work is finished
+```
+
+`flushUntilIdle` drains the scheduler until nothing is dirty, nothing is scheduled, and any in-flight flush is done.
+
+---
+
+## Error handling
+
+All errors from `attach/init/diff/effect/cleanup/host-init` are caught and forwarded:
+
+```js
+class App extends Component {
+  static onError(err, { phase, component, op }) {
+    // Your centralized error hook
+    // phase ∈ 'host-init' | 'attach' | 'init' | 'diff' | 'effect' | 'cleanup' | 'initial-diff'
+  }
+}
+```
+
+- Preference order: `App.constructor.onError` → `App.onError` → `Component` handlers (early boot) → `console.error`.
+- Errors do **not** stop the frame; Ride continues with remaining work.
+
+---
+
+## Scheduling details (priorities + budgets)
+
+- Batch sort order: **depth → componentPriority → creationOrder**.
+- With a small frame budget, Ride will **not split siblings** at the same depth. It yields only when moving into a **new depth group**. This keeps, e.g., all `Item` siblings together, then their `ItemInfo` children, etc.
+- Effective op priority = `componentPriority + opPriority`. Use sparingly where order truly matters.
+
+---
+
+## API additions
+
+### Component
+
+```ts
+class Component {
+  // behaviors
+  static behaviors?: Behavior[];
+  static use(...behaviors: Behavior[]): void;
+
+  // error hooks (optional on instances too)
+  static onError?(err, ctx): void;
+  onError?(err, ctx): void;
+}
+```
+
+### Ride
+
+```ts
+class Ride {
+  static flushUntilIdle(app, opts?): Promise<void>;
+}
+```
+
+---
+
+## Tiny behavior example
+
+```js
+// selectionBehavior.js
+export const SelectionBehavior = {
+  name: 'selection',
+  types: ['pointer', 'select'],
+  effect(op, ctx) {
+    const { type, payload } = op;
+    if (type === 'pointer') ctx.component._hover = payload.id;
+    if (type === 'select')  ctx.component._selected = payload.id;
+
+    // optional teardown for per-key resources
+    return () => { /* stop hover timers, etc. */ };
+  }
+};
+
+// scene.js
+export class Scene extends Component {
+  static behaviors = [SelectionBehavior];
+}
+```
+
+---
+
 **Notes**
 - `overscanRows`: default 1. Raise to 2–3 if you see pop-in on fast scrolls.
 - Virtualization and culling stack fine; virtualization does the heavy lifting.
+
+
+---
+
+# Locality-driven scheduling (depth vs subtree)
+
+Ride’s scheduler orders components by **depth → componentPriority → creationOrder** and slices work by a frame **budget**. How it *yields* between components is controlled by **locality**:
+
+- **`depth` (default):** The scheduler won’t split **siblings at the same depth**; it yields only when moving into a new depth group. This gives a “wave” feel (all `Item` siblings first, then their `ItemInfo` children, etc.).
+- **`subtree`:** The scheduler picks a root, then **drains that component and its descendants** (respecting priority and budget), before moving to the next root. This makes each item feel “fully” rendered (e.g., `Item → ItemInfo → Cover`) before the next sibling.
+
+### Opt in
+
+```ts
+class App extends Component {
+  static progressive = {
+    budget: 6,
+    locality: 'subtree',   // or 'depth' (default)
+  };
+}
+```
+
+You can also set `locality` on a subtree root class (e.g., `Item`) to prioritize “locality first” rendering for those instances without changing the whole app.
+
+### Mental model
+
+- **`depth`**: smoother global progress (waves), ideal for balanced pages.
+- **`subtree`**: better perceived latency for lists/grids — each card feels complete sooner.
+
+> Only **descendants of the current root** are pulled forward in `subtree` mode; unrelated siblings elsewhere in the tree are not interleaved.
+
+### Putting it together
+
+```ts
+export class Scene extends Component {
+  static behaviors = [GeometryBehavior({ includeSize: true }), EventsBehavior()];
+}
+
+export class Sprite extends Component {
+  static behaviors = [GeometryBehavior({ includeSize: true }), EventsBehavior()];
+  // add local TextureBehavior() right in this file if needed
+}
+
+export class Typography extends Component {
+  static behaviors = [TypographyBehavior(), GeometryBehavior(), EventsBehavior()];
+}
+```
+
+---
+
+# Tiny utility: `same` (generic comparator)
+
+A micro helper for **declarative “did this change?”** checks, shared by behaviors.
+
+```ts
+import { same } from '@lockvoid/ride/utils/same';
+
+// Usage patterns
+same(a, b)                               // strict ===
+same(a, b, same.shallow())               // arrays or plain objects
+same(a, b, same.byKeys(['x','y']))       // only selected keys
+same(a, b, same.tuple(2))                // 2-tuple arrays
+same(a, b, same.map({x:'strict', y:same.int()})) // per-key spec
+same(a, b, same.with(normalize, spec))   // normalize then compare
+same(a, b, same.eq(norm))                // Object.is after normalize
+same(a, b, same.int())                   // (v|0) integer compare
+```
+
+### Common recipes
+
+- **Geometry:** `same.map({ x: same.int(), y: same.int(), anchor: same.tuple(2) })`
+- **Events:** `same.byKeys(['onClick', 'onPointerDown', ...])`
+- **Shadows:** `same.with(normShadow, same.byKeys(['dx','dy','softness','color']))`
+- **Shallow props bag:** `same(prev, next, same.shallow())`
+
+> `same` is tiny by design; extend via `same.with()` and `same.map()` rather than adding domain-specific helpers.
+
+---
+
+# Testing helpers: locality & determinism
+
+- Use **`Ride.flushUntilIdle(app)`** after `raf()` when your behavior/effect does async work or when you need stable timing across budgets.
+- For locality tests:
+  - In **`depth`** mode, expect “waves” (all parents, then children).
+  - In **`subtree`** mode, expect **root + descendants** as a block, then the next root; unrelated siblings should not be interleaved into the current subtree.
+
+Example assertion sketch:
+
+```ts
+const order = effects.map(e => e.who);
+const idxItem0 = order.indexOf('Item 0');
+const idxInfo0 = order.indexOf('ItemInfo 0');
+const idxSidebar = order.indexOf('Sidebar');
+expect(idxInfo0).toBe(idxItem0 + 1);           // child immediately after parent (subtree)
+expect(idxSidebar).toBeGreaterThan(idxInfo0);  // unrelated stays after the subtree
+```
 
 ---
 
