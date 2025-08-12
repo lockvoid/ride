@@ -10,6 +10,7 @@
 // - No RAF scheduled while not ready (keeps buffers inspectable in tests)
 // - effect(op) may return a cleanup fn; it runs before the next effect of the same key and on unmount.
 // - Deterministic testing: Scheduler.whenIdle() + Ride.flushUntilIdle(app)
+// - Error surface: route errors to App.onError?.(err, { component, op, phase })
 
 /* ============================================================================
  * Constants
@@ -192,7 +193,12 @@ class Scheduler {
         if (component._destroyed) continue;
 
         // Ensure node attached (idempotent)
-        await component._ensureAttached();
+        try {
+          await component._ensureAttached();
+        } catch (err) {
+          component.runtime.reportError(err, { component, op: null, phase: 'attach' });
+          continue;
+        }
 
         // Drain this component once per frame
         if (component._cmds.size > 0) {
@@ -212,7 +218,11 @@ class Scheduler {
             break;
           }
 
-          await component._runInitialDiff();
+          try {
+            await component._runInitialDiff();
+          } catch (err) {
+            component.runtime.reportError(err, { component, op: null, phase: 'initial-diff' });
+          }
 
           // Anything queued during init/commit runs next RAF
           if (component._cmds.size > 0) this.dirty.add(component);
@@ -281,6 +291,7 @@ class Runtime {
     this.scheduler = scheduler;
     this.host = null;
     this.isReady = false;
+    this.app = null; // set by Ride.mount
 
     let resolveReady;
     this.whenReady = new Promise(resolve => { resolveReady = resolve; });
@@ -289,6 +300,31 @@ class Runtime {
       this.isReady = true;
       resolveReady(host);
     };
+  }
+
+  reportError(err, ctx) {
+    try {
+      // Prefer app-level handlers when available
+      const app = this.app;
+      let handler = app?.constructor?.onError || app?.onError;
+      let receiver = app;
+
+      // If app isn't set yet (e.g., errors during App constructor/diff),
+      // fall back to the component that raised the error.
+      if (typeof handler !== 'function') {
+        const comp = ctx?.component;
+        handler = comp?.constructor?.onError || comp?.onError;
+        receiver = comp;
+      }
+
+      if (typeof handler === 'function') {
+        handler.call(receiver, err, ctx);
+      } else {
+        console.error('[Ride] Unhandled error:', err, ctx);
+      }
+    } catch (e) {
+      console.error('[Ride] Error in onError handler:', e, { originalError: err, ctx });
+    }
   }
 }
 
@@ -386,15 +422,26 @@ export class Component {
     }
 
     this._needsInitialDiff = false;
-    this._hasInitialized = true;
+       this._hasInitialized = true;
 
     if (this._cmds.size) this.runtime.scheduler.markDirty(this);
   }
 
   async _runDiff(prev, next) {
     const ticket = ++this._diffTicket;
-    let result = this.diff(prev, next);
-    if (result && typeof result.then === 'function') result = await result;
+    let result;
+    try {
+      result = this.diff(prev, next);
+    } catch (err) {
+      this.runtime.reportError(err, { component: this, op: null, phase: 'diff' });
+      return DIFF.DEFER;
+    }
+    try {
+      if (result && typeof result.then === 'function') result = await result;
+    } catch (err) {
+      this.runtime.reportError(err, { component: this, op: null, phase: 'diff' });
+      return DIFF.DEFER;
+    }
     if (ticket !== this._diffTicket) return DIFF.DEFER; // stale
     return result === DIFF.DEFER ? DIFF.DEFER : DIFF.COMMIT;
   }
@@ -403,9 +450,13 @@ export class Component {
   async _effect(op) {
     if (op.type === '@ride/init') {
       if (!this._initDone) {
-        const maybe = this.init();
-        const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
-        if (typeof res === 'function') this._initCleanup = res;
+        try {
+          const maybe = this.init();
+          const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+          if (typeof res === 'function') this._initCleanup = res;
+        } catch (err) {
+          this.runtime.reportError(err, { component: this, op, phase: 'init' });
+        }
         this._initDone = true;
       }
       return; // swallowed
@@ -415,13 +466,25 @@ export class Component {
     const key = op.key;
     const prevCleanup = key != null ? this._cleanups.get(key) : null;
     if (prevCleanup) {
-      try { await prevCleanup(); } catch (e) { /* swallow cleanup errors */ }
-      this._cleanups.delete(key);
+      try {
+        await prevCleanup();
+      } catch (err) {
+        this.runtime.reportError(err, { component: this, op, phase: 'cleanup' });
+      } finally {
+        this._cleanups.delete(key);
+      }
     }
 
     if (typeof this.effect === 'function') {
-      const maybe = this.effect(op);
-      const res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+      let res;
+      try {
+        const maybe = this.effect(op);
+        res = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+      } catch (err) {
+        this.runtime.reportError(err, { component: this, op, phase: 'effect' });
+        return;
+      }
+
       if (typeof res === 'function' && key != null) {
         this._cleanups.set(key, res);
       }
@@ -511,13 +574,13 @@ export class Component {
 
     // Run all per-key cleanups
     for (const [, fn] of this._cleanups) {
-      try { await fn(); } catch (e) { /* swallow cleanup errors */ }
+      try { await fn(); } catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' }); }
     }
     this._cleanups.clear();
 
     // Run init-scope cleanup last
     if (typeof this._initCleanup === 'function') {
-      try { await this._initCleanup(); } catch (e) { /* swallow */ }
+      try { await this._initCleanup(); } catch (err) { this.runtime.reportError(err, { component: this, op: null, phase: 'cleanup' }); }
       this._initCleanup = null;
     }
 
@@ -568,6 +631,7 @@ export class Ride {
     const runtime = new Runtime(scheduler);
 
     const app = new AppClass(props, context, runtime, null); // immediate
+    runtime.app = app; // so we can surface errors to App.onError
 
     // Boot host asynchronously
     this._bootHost(AppClass, props, context, runtime, scheduler, app);
@@ -584,7 +648,7 @@ export class Ride {
         scheduler.markDirty(app); // first RAF after ready flushes everything
       }
     } catch (err) {
-      console.error('Ride host init failed:', err);
+      runtime.reportError(err, { component: app, op: null, phase: 'host-init' });
     }
   }
 

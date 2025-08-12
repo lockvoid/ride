@@ -4,11 +4,13 @@ import { MockHost, tick, delay, raf, createDeferred } from '../helpers';
 describe('Ride', () => {
   let diffs;
   let effects;
+  let calls;
   let log;
 
   beforeEach(() => {
     diffs = [];
     effects = [];
+    calls = [];
     log = [];
   });
 
@@ -888,5 +890,231 @@ describe('Ride', () => {
       'begin:a', 'end:a',
       'begin:b', 'end:b',
     ]);
+  });
+
+
+  const recordOnError = (ctxTag = '') => (err, ctx) => {
+    calls.push({
+      tag: ctxTag,
+      phase: ctx.phase,
+      opType: ctx.op?.type ?? null,
+      message: String(err && err.message || err),
+    });
+  };
+
+  it('reports effect errors and continues processing later ops', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = recordOnError('effect');
+
+      async init() {
+        this.queue('boom', { a: 1 });
+      }
+
+      effect(op) {
+        if (op.type === 'boom') throw new Error('effect fail');
+        calls.push({ ran: op.type });
+      }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf();
+    await Ride.flushUntilIdle(app);
+
+    // error was reported
+    expect(calls.find(c => c.tag === 'effect' && c.phase === 'effect')?.message).toBe('effect fail');
+
+    // schedule a non-throwing op; framework must keep running
+    app.queue('ok', {});
+    await raf();
+    await Ride.flushUntilIdle(app);
+
+    expect(calls.some(c => c.ran === 'ok')).toBe(true);
+  });
+
+  it('reports cleanup errors and still runs the next effect for the same key', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = recordOnError('cleanup');
+
+      async init() { this.queue('task', { step: 1 }); }
+
+      effect(op) {
+        calls.push({ effect: op.payload.step });
+        // cleanup throws
+        return async () => { throw new Error('cleanup kaboom'); };
+      }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf(); await Ride.flushUntilIdle(app);
+
+    app.queue('task', { step: 2 }); // replacement => triggers cleanup
+    await raf(); await Ride.flushUntilIdle(app);
+
+    const err = calls.find(c => c.tag === 'cleanup' && c.phase === 'cleanup');
+    expect(err?.message).toBe('cleanup kaboom');
+
+    // and the replacement effect still ran
+    expect(calls.some(c => c.effect === 2)).toBe(true);
+  });
+
+  it('reports diff errors but still processes ops queued before the throw', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = recordOnError('diff');
+
+      diff() {
+        this.queue('work', { x: 42 });
+        throw new Error('diff blew up');
+      }
+
+      effect(op) { calls.push({ work: op.payload.x }); }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf();              // schedule first flush (@ride/init + post-diff queued ops)
+    await Ride.flushUntilIdle(app);
+
+    // diff error reported
+    expect(calls.find(c => c.tag === 'diff' && c.phase === 'diff')?.message).toBe('diff blew up');
+
+    // yet effect still ran for the queued op
+    expect(calls.find(c => c.work === 42)).toBeTruthy();
+  });
+
+  it('reports init errors and continues', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = recordOnError('init');
+
+      async init() { throw new Error('init fail'); }
+
+      diff() { this.queue('after', {}); }
+      effect(op) { calls.push({ ran: op.type }); }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf(); await Ride.flushUntilIdle(app);
+
+    expect(calls.find(c => c.tag === 'init' && c.phase === 'init')?.message).toBe('init fail');
+    // After-op should still execute
+    expect(calls.some(c => c.ran === 'after')).toBe(true);
+  });
+
+  it('reports attach errors; a later markDirty retries and succeeds', async () => {
+    // Host that fails first attach, then succeeds
+    class FlakyHost {
+      constructor() { this.rootNode = {}; this._first = true; }
+      attachNode(_parent, _node) {
+        if (this._first) { this._first = false; throw new Error('attach nope'); }
+        // success on second attempt
+      }
+      detachNode() {}
+      destroyNode() {}
+      requestRender() {}
+    }
+
+    class App extends Component {
+      static async createHost() { return new FlakyHost(); }
+      static onError = recordOnError('attach');
+
+      createNode() { return {}; } // ensure there is a node to attach
+      async init() { this.queue('doit', {}); }
+      effect(op) { calls.push({ ran: op.type }); }
+    }
+
+    const app = Ride.mount(App, {});
+
+    await raf();              // first attempt -> attach throws and is reported
+    await Ride.flushUntilIdle(app);
+
+    const err = calls.find(c => c.tag === 'attach' && c.phase === 'attach');
+    expect(err?.message).toBe('attach nope');
+
+    // Re-mark dirty so scheduler retries attach
+    app.queue('doit', { again: true });
+    await raf(); await Ride.flushUntilIdle(app);
+
+    expect(calls.some(c => c.ran === 'doit')).toBe(true);
+  });
+
+  it('reports host-init errors (createHost) via Ride._bootHost', async () => {
+    const onError = vi.fn();
+
+    class App extends Component {
+      static async createHost() { throw new Error('host boot broken'); }
+      static onError = onError;
+
+      effect() { calls.push('ran'); }
+    }
+
+    Ride.mount(App, {});
+    // give _bootHost a tick to run and report
+    await delay(0);
+
+    expect(onError).toHaveBeenCalled();
+    const [err, ctx] = onError.mock.calls[0];
+    expect(err.message).toBe('host boot broken');
+    expect(ctx.phase).toBe('host-init');
+  });
+
+  it('reports cleanup errors thrown on unmount', async () => {
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = recordOnError('unmount-cleanup');
+
+      async init() { this.queue('x', {}); }
+      effect() { return async () => { throw new Error('unmount boom'); }; }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf(); await Ride.flushUntilIdle(app);
+
+    await Ride.unmount(app);
+
+    const err = calls.find(c => c.tag === 'unmount-cleanup' && c.phase === 'cleanup');
+    expect(err?.message).toBe('unmount boom');
+  });
+
+  it('prefers static onError over instance onError', async () => {
+    const staticSpy = vi.fn();
+    const instanceSpy = vi.fn();
+
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      static onError = staticSpy;
+      onError = instanceSpy;
+
+      async init() { this.queue('boom', {}); }
+      effect() { throw new Error('whoops'); }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf(); await Ride.flushUntilIdle(app);
+
+    expect(staticSpy).toHaveBeenCalledTimes(1);
+    expect(instanceSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to console.error if no onError handler is provided (no throw)', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      class App extends Component {
+        static async createHost() { return new MockHost(); }
+        async init() { this.queue('boom', {}); }
+        effect() { throw new Error('no handler'); }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf(); await Ride.flushUntilIdle(app);
+
+      expect(spy).toHaveBeenCalled();
+      const msg = spy.mock.calls[0][0];
+      expect(String(msg)).toContain('[Ride] Unhandled error');
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
