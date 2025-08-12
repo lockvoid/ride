@@ -108,6 +108,7 @@ class CommandBuffer {
         }
         return false;
       }
+
       await effect(snapshot[i]);
     }
 
@@ -143,9 +144,22 @@ class Scheduler {
 
     this._frameStart = performance.now();
     const noBudget = this.frameBudgetMs <= 0 || !Number.isFinite(this.frameBudgetMs);
-    const shouldYield = () =>
-      noBudget ? false : (performance.now() - this._frameStart) >= this.frameBudgetMs;
+    const shouldYield = () => {
+      if (noBudget) {
+        return false;
+      }
 
+      const exceededBudget = (performance.now() - this._frameStart) >= this.frameBudgetMs;
+
+      if (exceededBudget) {
+        console.log('!!!!!!!!!!!!!');
+        console.log('!!!!!!!!!!!!!');
+        console.log('!!!!!!!!!!!!!');
+        console.log('!!!!!!!!!!!!!');
+      }
+
+      return exceededBudget;
+    };
     // Component batch: depth -> componentPriority -> creationOrder
     const batch = [...this.dirty].sort((a, b) =>
       ((a._depth | 0) - (b._depth | 0)) ||
@@ -171,6 +185,7 @@ class Scheduler {
       await component._ensureAttached();
 
       // Drain this component once per frame
+
       if (component._cmds.size > 0) {
         const drained = await component._cmds.drain(
           component._effect.bind(component),

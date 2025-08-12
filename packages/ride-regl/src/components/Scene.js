@@ -19,7 +19,6 @@ class Scene extends Component {
       !sameAnchor(prev.anchor, next.anchor) ||
       prev.scissor !== next.scissor;
 
-    console.log('sdsd', next.anchor)
     if (geomChanged) {
       this.queue('SET_PROPS', {
         x: next.x | 0,

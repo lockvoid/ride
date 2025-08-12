@@ -20,7 +20,9 @@ class App extends Component {
   static progressive = { budget: 8 };
 
   static async createHost(props) {
-    return Host.create({ container: props.container,  autoResize: { policy: 'live' } });
+    const host = await Host.create({ container: props.container, autoResize: { policy: 'live' } });
+
+    return host;
   }
 
   async init() {
@@ -48,7 +50,7 @@ class App extends Component {
 
 
 
-    const bmp = await loadImageBitmap('/grid.png');
+    const bmp = await loadImageBitmap('/public/grid.png');
     console.log('[demo] imageBitmap', bmp.width, bmp.height); // should log real size
 
     // ⬇️ mount INTO the scene, not the app

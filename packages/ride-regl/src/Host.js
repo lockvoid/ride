@@ -30,9 +30,9 @@ class Host {
   }
 
   // one-liner for Ride.createHost
-  static async create({ container = document.body, width, height, dpr, autoResize = true } = {}) {
+  static async create({ className, container = document.body, width, height, dpr, autoResize = true } = {}) {
     const canvas = document.createElement('canvas');
-    canvas.className = 'ride-regl-canvas';
+    canvas.className = className;
     container.appendChild(canvas);
 
     const host = new Host({ canvas });
