@@ -737,7 +737,7 @@ describe('Ride', () => {
         log.push(`effect:${op.payload.step}`);
         return async () => {
           log.push(`cleanup-start:${op.payload.step}`);
-          await timeout(10); // simulate async teardown inside cleanup
+          await delay(10); // simulate async teardown inside cleanup
           log.push(`cleanup-done:${op.payload.step}`);
         };
       }
@@ -822,6 +822,71 @@ describe('Ride', () => {
       'cleanup:A',
       'effect:B',
       'cleanup:B',
+    ]);
+  });
+
+  it('keeps cleanup+next-effect atomic for the same key even if budget is tiny', async () => {
+      const calls = [];
+
+      class App extends Component {
+        static progressive = { budget: 1 }; // very tight budget
+        static async createHost() { return new MockHost(); }
+        async init() { this.queue('sub', { step: 1 }); }
+        effect(op) {
+          calls.push(`effect:${op.payload.step}`);
+          return async () => {
+            calls.push(`cleanup-start:${op.payload.step}`);
+            // Long cleanup that exceeds budget
+            await delay(12);
+            calls.push(`cleanup-done:${op.payload.step}`);
+          };
+        }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf();
+      await Ride.flushUntilIdle(app);
+      expect(calls).toEqual(['effect:1']);
+
+      // Replacement
+      app.queue('sub', { step: 2 });
+
+      await raf();
+      await Ride.flushUntilIdle(app);
+
+      // Even with budget overrun, cleanup(1) completes before effect(2)
+      expect(calls).toEqual([
+        'effect:1',
+        'cleanup-start:1',
+        'cleanup-done:1',
+        'effect:2',
+      ]);
+    });
+
+  it('flushUntilIdle waits for in-flight async effect work', async () => {
+    const seen = [];
+
+    class App extends Component {
+      static async createHost() { return new MockHost(); }
+      async init() {
+        // two different keys to ensure we drain multiple ops
+        this.queue('a', { n: 1 });
+        this.queue('b', { n: 2 });
+      }
+      async effect(op) {
+        seen.push(`begin:${op.type}`);
+        await delay(5);
+        seen.push(`end:${op.type}`);
+      }
+    }
+
+    const app = Ride.mount(App, {});
+    await raf();
+    await Ride.flushUntilIdle(app);
+
+    expect(seen).toEqual([
+      'begin:a', 'end:a',
+      'begin:b', 'end:b',
     ]);
   });
 });
