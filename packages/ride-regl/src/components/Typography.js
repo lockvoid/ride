@@ -75,8 +75,12 @@ class Typography extends Component {
 
   async effect(op) {
     const host = this.runtime.host;
-    if (op.type === 'SET_TEXT_PROPS') host.setTextProps(this.node, op.payload);
-    if (op.type === 'SET_PROPS') host.setProps(this.node, op.payload);
+    if (op.type === 'SET_TEXT_PROPS') {
+      return host.setTextProps(this.node, op.payload);
+    }
+    if (op.type === 'SET_PROPS') {
+      return host.setProps(this.node, op.payload);
+    }
   }
 }
 

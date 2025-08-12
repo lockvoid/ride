@@ -38,8 +38,14 @@ class Sprite extends Component {
 
   async effect(op) {
     const host = this.runtime.host;
-    if (op.type === 'SET_PROPS') host.setProps(this.node, op.payload);
-    if (op.type === 'SET_TEXTURE') host.setTexture(this.node, op.payload.source);
+
+    if (op.type === 'SET_PROPS') {
+      return host.setProps(this.node, op.payload);
+    }
+
+    if (op.type === 'SET_TEXTURE') {
+      return host.setTexture(this.node, op.payload.source, { contentHash: !!op.payload.contentHash });
+    }
   }
 }
 

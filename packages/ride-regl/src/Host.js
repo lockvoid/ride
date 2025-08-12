@@ -7,7 +7,7 @@ class Host {
     this.regl = null;
 
     // scene graph
-    this.rootNode = null;   // { id, kind, children, props, texture, texSize, _lastSource }
+    this.rootNode = null;   // { id, kind, children, props, texture, texSize, _lastSource, _texEntry, _geom }
     this.nodes = new Map();
 
     // draw scheduling (used by Ride)
@@ -30,12 +30,16 @@ class Host {
     this._onCtxRestored = null;
 
     // MSDF registry
-    // fontName -> {
-    //   imageData: ImageBitmap[], atlasTex: regl.texture[], atlasW, atlasH, emSize, lineHeight, base,
-    //   glyphs: Map(codepoint -> { x,y,w,h,xoff,yoff,xadv,page }),
-    //   kern: Map(first -> Map(second -> amount))
-    // }
+    // fontName -> { imageData: ImageBitmap[], atlasTex: regl.texture[], atlasW, atlasH, emSize, lineHeight, base, glyphs(Map), kern(Map) }
     this.msdf = { fonts: new Map() };
+
+    // — Texture cache —
+    // byObj: identity cache (fast path)
+    // byKey: URL/Blob/content-hash cache (cross-object dedupe)
+    this._texCache = {
+      byObj: new WeakMap(),  // source object -> entry
+      byKey: new Map(),      // string key     -> entry
+    };
   }
 
   // one-liner for Ride.createHost
@@ -67,8 +71,7 @@ class Host {
     this.regl = createREGL({
       canvas: this.canvas,
       attributes: { alpha: true, antialias: true, premultipliedAlpha: true },
-      // WebGL1: derivatives for fwidth/dFdx/dFdy
-      extensions: ['OES_standard_derivatives'],
+      extensions: ['OES_standard_derivatives'], // WebGL1: for fwidth/dFdx/dFdy
     });
 
     // scene root
@@ -134,7 +137,7 @@ class Host {
       scissor: { enable: this.regl.prop('scissorEnabled'), box: this.regl.prop('scissorBox') },
     });
 
-    // —— MSDF TEXT pipeline (WebGL1, improved AA) ————————————————————
+    // —— MSDF TEXT pipeline (improved AA) ————————————————————————————
     const textVert = `
       precision mediump float;
       attribute vec2 aPosPx;   // local vertex in DEVICE px (y down)
@@ -156,7 +159,6 @@ class Host {
       }
     `;
 
-    // NOTE: the extension pragma MUST be the very first line.
     const textFrag = `
 #extension GL_OES_standard_derivatives : enable
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -174,17 +176,13 @@ float median3(vec3 v){ return max(min(v.r,v.g), min(max(v.r,v.g), v.b)); }
 void main() {
   vec3 msdf = texture2D(uAtlas, vUV).rgb;
 
-  // Signed distance in MSDF's domain (0.5 = edge)
   float sd = median3(msdf) - 0.5;
 
-  // AA width from per-channel gradients (screen-space)
   vec3 w3 = fwidth(msdf);
   float w = max(median3(w3), 1e-6);
 
-  // Optional softness widening (unitless factor)
   w *= (1.0 + max(uSoft, 0.0));
 
-  // Linear coverage (avoids halos); use smoothstep(-w,w,sd) if you prefer
   float alpha = clamp(sd / w + 0.5, 0.0, 1.0);
 
   gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
@@ -220,17 +218,22 @@ void main() {
       this._ctxLost = false;
       try { this.regl && this.regl.destroy(); } catch {}
       this.regl = null;
-      // drop old GPU resources
+
+      // drop old GPU resources (buffers)
       this.nodes.forEach(n => {
-        if (n.texture) { try { n.texture.destroy(); } catch {} n.texture = null; }
         if (n._geom) {
           try { n._geom.pages?.forEach(pg => pg.aPosPx?.destroy?.()); } catch {}
           try { n._geom.pages?.forEach(pg => pg.aUV?.destroy?.()); } catch {}
           n._geom = null;
         }
       });
+
+      // clear texture cache (old GL handles are invalid anyway)
+      this._texCache.byKey.clear();
+      this._texCache.byObj = new WeakMap();
+
       // re-init pipeline
-      this.init().then(() => {
+      this.init().then(async () => {
         // re-upload MSDF atlas textures from saved imageData (with filtering)
         this.msdf.fonts.forEach((f) => {
           try { f.atlasTex?.forEach(tex => tex.destroy?.()); } catch {}
@@ -242,8 +245,10 @@ void main() {
           });
           f.atlasTex = f.imageData.map(makeTex);
         });
-        // re-upload sprite textures
+
+        // re-upload sprite textures lazily from _lastSource
         this.nodes.forEach(n => { if (n._lastSource) this.setTexture(n, n._lastSource); });
+
         // redraw immediately at current size
         this._applySize({ commit: true, redrawNow: true });
       });
@@ -257,63 +262,178 @@ void main() {
     if (this._ro) { this._ro.disconnect(); this._ro = null; }
     this.canvas.removeEventListener('webglcontextlost', this._onCtxLost, false);
     this.canvas.removeEventListener('webglcontextrestored', this._onCtxRestored, false);
+
+    // release node resources
     for (const n of this.nodes.values()) {
-      if (n.texture && n.texture.destroy) n.texture.destroy();
       if (n._geom?.pages) {
         try { n._geom.pages.forEach(pg => pg.aPosPx?.destroy?.()); } catch {}
         try { n._geom.pages.forEach(pg => pg.aUV?.destroy?.()); } catch {}
       }
+      if (n._texEntry) {
+        try { this._releaseTextureEntry(n._texEntry); } catch {}
+      } else if (n.texture) {
+        try { n.texture.destroy?.(); } catch {}
+      }
     }
     this.nodes.clear();
+
     // destroy font textures
     this.msdf.fonts.forEach(f => { try { f.atlasTex?.forEach(tex => tex.destroy?.()); } catch {} });
+    this.msdf.fonts.clear();
+
+    // clear texture cache
+    this._texCache.byKey.forEach(e => { try { e.tex?.destroy?.(); } catch {} });
+    this._texCache.byKey.clear();
+    this._texCache.byObj = new WeakMap();
+
     if (this.regl) this.regl.destroy();
+  }
+
+  // ————————————————————————————————————————————————
+  // Texture cache helpers
+  // ————————————————————————————————————————————————
+  _makeTex(source) {
+    return this.regl.texture({
+      data: source,
+      flipY: true,
+      min: 'linear', mag: 'linear',
+      wrapS: 'clamp', wrapT: 'clamp',
+      mipmap: false,
+    });
+  }
+
+  _getDimensions(source) {
+    if (source instanceof HTMLCanvasElement) return [source.width, source.height];
+    if (typeof OffscreenCanvas !== 'undefined' && source instanceof OffscreenCanvas) return [source.width, source.height];
+    if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) return [source.width, source.height];
+    if (source instanceof HTMLImageElement) return [source.naturalWidth || source.width, source.naturalHeight || source.height];
+    if (source instanceof HTMLVideoElement) return [source.videoWidth || 0, source.videoHeight || 0];
+    return [0, 0];
+  }
+
+  _keyFromUrlish(source) {
+    try {
+      if (source instanceof HTMLImageElement) {
+        const url = source.currentSrc || source.src || '';
+        if (url) {
+          const [w, h] = this._getDimensions(source);
+          return `url:${url}#${w}x${h}`;
+        }
+      }
+      if (typeof File !== 'undefined' && source instanceof File) {
+        return `file:${source.name}:${source.size}:${source.lastModified}`;
+      }
+      if (typeof Blob !== 'undefined' && source instanceof Blob && 'size' in source) {
+        return `blob:${source.size}:${(source.type||'')}`;
+      }
+    } catch {}
+    return null;
+  }
+
+  async _fingerprint64(source) {
+    const W = 64, H = 64;
+    try {
+      const off = (typeof OffscreenCanvas !== 'undefined')
+        ? new OffscreenCanvas(W, H)
+        : (() => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; })();
+      const ctx = off.getContext('2d', { willReadFrequently: true });
+      ctx.imageSmoothingEnabled = true;
+      const [sw, sh] = this._getDimensions(source);
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(source, 0, 0, sw, sh, 0, 0, W, H);
+      const img = ctx.getImageData(0, 0, W, H).data; // ~16 KB
+
+      if (crypto?.subtle?.digest) {
+        const buf = await crypto.subtle.digest('SHA-1', img);
+        const bytes = new Uint8Array(buf);
+        let hex = '';
+        for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+        return `sha1:${hex}`;
+      } else {
+        // fallback djb2
+        let h = 5381;
+        for (let i = 0; i < img.length; i++) h = ((h << 5) + h) ^ img[i];
+        return `djb2:${(h>>>0).toString(16)}`;
+      }
+    } catch {
+      return null; // tainted or drawImage failed
+    }
+  }
+
+  async _acquireTextureFromSource(source, { contentHash = false } = {}) {
+    // Tier 0: identity cache
+    const hit = this._texCache.byObj.get(source);
+    if (hit) { hit.refs++; return hit; }
+
+    // Tier 1: URL/Blob-derived key
+    let key = this._keyFromUrlish(source);
+
+    // Tier 2: optional content fingerprint
+    if (!key && contentHash) {
+      const fp = await this._fingerprint64(source);
+      if (fp) key = `fp:${fp}`;
+    }
+
+    if (key && this._texCache.byKey.has(key)) {
+      const entry = this._texCache.byKey.get(key);
+      entry.refs++;
+      this._texCache.byObj.set(source, entry);
+      console.log('CACHE FOUND')
+      return entry;
+    }
+
+    const tex = this._makeTex(source);
+    const [w, h] = this._getDimensions(source);
+    const entry = { tex, key: key || null, refs: 1, width: w, height: h };
+
+    this._texCache.byObj.set(source, entry);
+    if (key) this._texCache.byKey.set(key, entry);
+
+    return entry;
+  }
+
+  _releaseTextureEntry(entry) {
+    if (!entry) return;
+    entry.refs = Math.max(0, (entry.refs|0) - 1);
+    if (entry.refs === 0) {
+      try { entry.tex?.destroy?.(); } catch {}
+      if (entry.key) this._texCache.byKey.delete(entry.key);
+      // byObj entries fall out naturally when the source object GCs
+    }
   }
 
   // ————————————————————————————————————————————————
   // Fonts (fontbm JSON .fnt + atlas pages)
   // ————————————————————————————————————————————————
-  // Usage 1: await host.registerFont('Inter', { fontUrl: '/fonts/Inter-Regular.fnt' })
-  // Usage 2 (legacy): host.registerFont('Inter', { imageData: ImageBitmap|ImageBitmap[], fontData: {...} })
   async registerFont(fontName, opts) {
     const makeTex = (img) => this.regl.texture({
-      data: img,
-      flipY: true,
+      data: img, flipY: true,
       min: 'linear', mag: 'linear',
       wrapS: 'clamp', wrapT: 'clamp',
       mipmap: false,
     });
 
     if (opts.fontUrl) {
-      // Load JSON
       const fontUrl = opts.fontUrl.trim();
       const base = new URL(fontUrl, window.location.href);
       const fontData = await fetch(base).then(r => r.json());
 
-      // Pages list (fontbm: fontData.pages array of filenames)
       let pageNames = [];
-      if (Array.isArray(fontData.pages) && fontData.pages.length > 0) {
-        pageNames = fontData.pages;
-      } else if (Array.isArray(fontData.page) && fontData.page.length > 0) {
-        pageNames = fontData.page; // rare alt key
-      } else {
-        // derive `<stem>_0.png` next to .fnt
+      if (Array.isArray(fontData.pages) && fontData.pages.length > 0) pageNames = fontData.pages;
+      else if (Array.isArray(fontData.page) && fontData.page.length > 0) pageNames = fontData.page;
+      else {
         const stem = base.pathname.replace(/\.[^.]+$/, '');
-        const file = stem.split('/').pop() + '.png';
-        pageNames = [file];
+        pageNames = [stem.split('/').pop() + '_0.png'];
       }
 
-      // Fetch all pages as ImageBitmap[]
       const imageData = await Promise.all(pageNames.map(async (name) => {
         const url = new URL(name, base);
         const blob = await fetch(url).then(r => r.blob());
         return await createImageBitmap(blob);
       }));
 
-      // Build textures (with proper filtering, no mipmaps)
       const atlasTex = imageData.map(makeTex);
 
-      // Parse metrics
       const common = fontData.common || {};
       const info   = fontData.info || {};
       const atlasW = common.scaleW, atlasH = common.scaleH;
@@ -342,7 +462,7 @@ void main() {
       return;
     }
 
-    // Legacy/manual path (already have images + JSON)
+    // Legacy/manual path
     const fontData = opts.fontData;
     const imgs = Array.isArray(opts.imageData) ? opts.imageData : [opts.imageData];
     const atlasTex = imgs.map(makeTex);
@@ -379,7 +499,7 @@ void main() {
   // ————————————————————————————————————————————————
   createNode(_component, kind = 'scene') {
     const id = `${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 7)}`;
-    const node = { id, kind, parent: undefined, children: [], props: {}, texture: null, texSize: null, _lastSource: null };
+    const node = { id, kind, parent: undefined, children: [], props: {}, texture: null, texSize: null, _lastSource: null, _texEntry: null, _geom: null };
     this.nodes.set(id, node);
     return node;
   }
@@ -393,7 +513,6 @@ void main() {
       shadow: null,         // { dx, dy, color, softness }
       truncateWidth: Infinity,
     };
-    node._geom = null;
     return node;
   }
   attachNode(parent, child) {
@@ -408,10 +527,15 @@ void main() {
     child.parent = undefined;
   }
   destroyNode(node) {
-    if (node.texture && node.texture.destroy) node.texture.destroy();
     if (node._geom?.pages) {
       try { node._geom.pages.forEach(pg => pg.aPosPx?.destroy?.()); } catch {}
       try { node._geom.pages.forEach(pg => pg.aUV?.destroy?.()); } catch {}
+    }
+    if (node._texEntry) {
+      this._releaseTextureEntry(node._texEntry);
+      node._texEntry = null;
+    } else if (node.texture) {
+      try { node.texture.destroy?.(); } catch {}
     }
     this.nodes.delete(node.id);
   }
@@ -429,17 +553,27 @@ void main() {
     }
     this.requestRender();
   }
-  setTexture(node, source) {
+
+  // — Cached, async —
+  // opts: { contentHash?: boolean }  // if true, dedupe across different objects by 64x64 fingerprint
+  async setTexture(node, source, opts = {}) {
     if (!this.regl) return;
-    if (node.texture) node.texture.destroy();
-    node.texture = this.regl.texture(source);
+    // release previous
+    if (node._texEntry) {
+      this._releaseTextureEntry(node._texEntry);
+      node._texEntry = null;
+    } else if (node.texture) {
+      try { node.texture.destroy?.(); } catch {}
+    }
+
     node._lastSource = source;
 
-    let w = 0, h = 0;
-    if (source instanceof HTMLCanvasElement) { w = source.width; h = source.height; }
-    else if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) { w = source.width; h = source.height; }
-    else if (source instanceof HTMLImageElement) { w = source.naturalWidth || source.width; h = source.naturalHeight || source.height; }
-    node.texSize = [w, h];
+    const entry = await this._acquireTextureFromSource(source, { contentHash: !!opts.contentHash });
+    node._texEntry = entry;
+    node.texture = entry.tex;
+    node.texSize = [entry.width, entry.height];
+
+    // no implicit render here; Sprite/Typography will requestRender via setProps
   }
 
   // drawing
@@ -542,7 +676,7 @@ void main() {
       x += (prev != null ? kernOf(prev, c) : 0);
 
       const x0css = x + g.xoff * scale;
-      const y0css = basePx + g.yoff * scale; // top-left of glyph box from line top
+      const y0css = basePx + g.yoff * scale;
       const wcss = g.w * scale, hcss = g.h * scale;
 
       const x0 = x0css * dpr;
@@ -575,7 +709,7 @@ void main() {
     }
 
     return {
-      pages,                         // array of { page, aPosPx, aUV, count }
+      pages,
       sizeCss: [textWcss, textHcss],
       sizeDev: [textWdev, textHdev],
       textOut: String.fromCodePoint(...out),
@@ -641,7 +775,6 @@ void main() {
       // ORIGIN = top-left for children (container-only). For sprites we keep pivot and let shader anchor.
       let originX = pivotX, originY = pivotY;
 
-      // IMPORTANT: Only containers (non-sprites) shift their origin by -anchor*size
       if (node.kind !== 'sprite') {
         const wCss = p.width  ?? 0;
         const hCss = p.height ?? 0;
@@ -659,11 +792,9 @@ void main() {
 
       const a = (p.alpha == null ? 1 : p.alpha) * parentAlpha;
 
-      // Scissor (axis-aligned). When rotated, this is a best-effort box.
+      // Scissor
       let localScissorCss = null;
-      if (p.scissor) {
-        localScissorCss = offsetRect(p.scissor, originX, originY);
-      }
+      if (p.scissor) localScissorCss = offsetRect(p.scissor, originX, originY);
       const mergedScissorCss = intersect(parentScissorCss, localScissorCss);
 
       // SPRITE draw
@@ -697,7 +828,7 @@ void main() {
       // TEXT draw (MSDF)
       if (node.kind === 'text') {
         const t = node.text;
-        const dpr = dprX;
+        const dpr = canvasW / (this._lastCss.w || this.canvas.clientWidth || canvasW);
 
         if (!node._geom) {
           node._geom = this._createTextGeometryBM(node, {
@@ -737,7 +868,7 @@ void main() {
               uAtlas: font.atlasTex[pg.page] || font.atlasTex[0],
             };
 
-            // shadow pass
+            // shadow
             if (t.shadow) {
               const dx = t.shadow.dx ?? 1;
               const dy = t.shadow.dy ?? 1;
@@ -753,17 +884,17 @@ void main() {
               });
             }
 
-            // main pass (no extra softness)
+            // main (sharp)
             this.drawTextMSDF({
               ...uniformsCommon,
-              uColor: [mainColor[0], mainColor[1], mainColor[2], mainColor[3] * a], // parent alpha
+              uColor: [mainColor[0], mainColor[1], mainColor[2], mainColor[3] * a],
               uSoft: 0.0,
             });
           }
         }
       }
 
-      // Children use ORIGIN (top-left after container anchor shift)
+      // Children
       for (const child of node.children) {
         visit(child, originX, originY, a, mergedScissorCss, totalRotation);
       }
@@ -783,7 +914,6 @@ void main() {
     const wDev = Math.max(1, Math.floor(wCss * DPR));
     const hDev = Math.max(1, Math.floor(hCss * DPR));
 
-    // CSS size first (no blink)
     if (this._lastCss.w !== wCss || this._lastCss.h !== hCss) {
       this.canvas.style.width = wCss + 'px';
       this.canvas.style.height = hCss + 'px';
@@ -796,13 +926,11 @@ void main() {
       this._lastDev = { w: wDev, h: hDev, dpr: DPR };
     }
 
-    if (redrawNow) this.frame(); // draw synchronously in the same frame
+    if (redrawNow) this.frame();
   }
 
   _installAutoResize() {
-    const onRO = () => {
-      this._applySize({ commit: true, redrawNow: true });
-    };
+    const onRO = () => { this._applySize({ commit: true, redrawNow: true }); };
     this._ro = new ResizeObserver(onRO);
     this._ro.observe(this._container);
 
