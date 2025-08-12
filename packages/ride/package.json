@@ -19,6 +19,7 @@
     "vitest": "^3.2.4"
   },
   "exports": {
+    "./utils": "./src/utils.js",
     ".": {
       "types": "./types/index.d.mts",
       "default": "./src/index.js"

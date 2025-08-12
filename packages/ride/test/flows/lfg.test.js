@@ -1309,4 +1309,238 @@ describe('Ride', () => {
       expect(ctx.phase).toBe('cleanup');
     });
   });
+
+  describe('Locality (Subtree)', async () => {
+    it('locality=subtree: processes an Item and its children before moving to the next Item', async () => {
+      const calls = [];
+
+      class App extends Component {
+        static progressive = { budget: 8 };
+        static async createHost() { return new MockHost(); }
+        async init() {
+          // three siblings at depth=1
+          this.mount(Item, { id: 0 });
+          this.mount(Item, { id: 1 });
+          this.mount(Item, { id: 2 });
+        }
+      }
+
+      class Item extends Component {
+        static progressive = { priority: 0, locality: 'subtree' }; // << NEW
+        async init() {
+          // children at deeper depth (prio 5, 10)
+          this.mount(ItemInfo,  { id: this.props.id });
+          this.mount(ItemCover, { id: this.props.id });
+          this.queue('render', { who: `Item ${this.props.id}` }, { key: `i|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemInfo extends Component {
+        static progressive = { priority: 5 };
+        async init() {
+          this.queue('render', { who: `ItemInfo ${this.props.id}` }, { key: `info|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemCover extends Component {
+        static progressive = { priority: 10 };
+        async init() {
+          this.queue('render', { who: `ItemCover ${this.props.id}` }, { key: `cover|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf();                 // schedule first frame after host ready
+      await Ride.flushUntilIdle(app);
+
+      expect(calls).toEqual([
+        // Item 0 subtree first
+        'Item 0', 'ItemInfo 0', 'ItemCover 0',
+        // then Item 1 subtree
+        'Item 1', 'ItemInfo 1', 'ItemCover 1',
+        // then Item 2 subtree
+        'Item 2', 'ItemInfo 2', 'ItemCover 2',
+      ]);
+    });
+
+    it('locality=depth (default): renders in depth waves (Items → Info → Cover)', async () => {
+      const calls = [];
+
+      class App extends Component {
+        static progressive = { budget: 8 };
+        static async createHost() { return new MockHost(); }
+        async init() {
+          this.mount(Item, { id: 0 });
+          this.mount(Item, { id: 1 });
+          this.mount(Item, { id: 2 });
+        }
+      }
+
+      class Item extends Component {
+        static progressive = { priority: 0 }; // no locality specified (defaults to 'depth')
+        async init() {
+          this.mount(ItemInfo,  { id: this.props.id });
+          this.mount(ItemCover, { id: this.props.id });
+          this.queue('render', { who: `Item ${this.props.id}` }, { key: `i|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemInfo extends Component {
+        static progressive = { priority: 5 };
+        async init() {
+          this.queue('render', { who: `ItemInfo ${this.props.id}` }, { key: `info|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemCover extends Component {
+        static progressive = { priority: 10 };
+        async init() {
+          this.queue('render', { who: `ItemCover ${this.props.id}` }, { key: `cover|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf();
+      await Ride.flushUntilIdle(app);
+
+      expect(calls).toEqual([
+        // all Items first
+        'Item 0', 'Item 1', 'Item 2',
+        // then all Info
+        'ItemInfo 0', 'ItemInfo 1', 'ItemInfo 2',
+        // then all Covers
+        'ItemCover 0', 'ItemCover 1', 'ItemCover 2',
+      ]);
+    });
+
+    it('locality=subtree: respects op-level budget; finishes subtree before moving to next sibling (across RAFs if needed)', async () => {
+      const calls = [];
+
+      class App extends Component {
+        static progressive = { budget: 5 }; // pretty small
+        static async createHost() { return new MockHost(); }
+        async init() {
+          this.mount(Item, { id: 0 });
+          this.mount(Item, { id: 1 });
+        }
+      }
+
+      class Item extends Component {
+        static progressive = { priority: 0, locality: 'subtree' };
+        async init() {
+          this.mount(ItemInfo,  { id: this.props.id });
+          this.mount(ItemCover, { id: this.props.id });
+          this.queue('render', { who: `Item ${this.props.id}` }, { key: `i|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemInfo extends Component {
+        static progressive = { priority: 5 };
+        async init() {
+          this.queue('render', { who: `ItemInfo ${this.props.id}` }, { key: `info|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemCover extends Component {
+        static progressive = { priority: 10 };
+        async init() {
+          this.queue('render', { who: `ItemCover ${this.props.id}` }, { key: `cover|${this.props.id}` });
+        }
+        async effect(op) {
+          // Simulate heavier work so the snapshot drain may consider yielding
+          await delay(6);
+          if (op.type === 'render') calls.push(op.payload.who);
+        }
+      }
+
+      const app = Ride.mount(App, {});
+
+      // First RAF — should process Item 0 subtree; possibly split across frames due to budget,
+      // but MUST NOT process Item 1 before finishing Item 0 subtree.
+      await raf();
+      await Ride.flushUntilIdle(app);
+
+      // We expect: complete subtree for 0 before any 'Item 1'
+      const firstItem1 = calls.findIndex(x => x.includes('Item 1'));
+      const lastItem0  = calls.map((x,i) => ({x,i})).filter(o => o.x.includes('0')).pop().i;
+      expect(firstItem1).toBeGreaterThan(lastItem0);
+
+      // And the final overall order is still grouped by subtree:
+      expect(calls).toEqual([
+        'Item 0', 'ItemInfo 0', 'ItemCover 0',
+        'Item 1', 'ItemInfo 1', 'ItemCover 1',
+      ]);
+    });
+
+    it('subtree: only pulls descendants of the current root, not unrelated components', async () => {
+      const calls = [];
+
+      class App extends Component {
+        static progressive = { budget: 8 };
+        static async createHost() { return new MockHost(); }
+        async init() {
+          this.mount(Item, { id: 0 });     // prio 0, locality=subtree
+          this.mount(Sidebar, {});         // prio 2
+          this.mount(Item, { id: 1 });     // prio 0, locality=subtree
+        }
+      }
+
+      class Sidebar extends Component {
+        static progressive = { priority: 2 };
+        init() { this.queue('render', { who: 'Sidebar' }, { key: 'sidebar' }); }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class Item extends Component {
+        static progressive = { priority: 0, locality: 'subtree' };
+        init() {
+          this.mount(ItemInfo, { id: this.props.id });
+          this.queue('render', { who: `Item ${this.props.id}` }, { key: `i|${this.props.id}` });
+        }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      class ItemInfo extends Component {
+        static progressive = { priority: 5 };
+        init() { this.queue('render', { who: `ItemInfo ${this.props.id}` }, { key: `info|${this.props.id}` }); }
+        effect(op) { if (op.type === 'render') calls.push(op.payload.who); }
+      }
+
+      const app = Ride.mount(App, {});
+      await raf();
+      await Ride.flushUntilIdle(app);
+
+      const idxItem0   = calls.indexOf('Item 0');
+      const idxInfo0   = calls.indexOf('ItemInfo 0');
+      const idxItem1   = calls.indexOf('Item 1');
+      const idxInfo1   = calls.indexOf('ItemInfo 1');
+      const idxSidebar = calls.indexOf('Sidebar');
+
+      // Child immediately follows its parent due to subtree locality
+      expect(idxInfo0).toBe(idxItem0 + 1);
+
+      // Next sibling (prio 0) before Sidebar (prio 2)
+      expect(idxItem1).toBeGreaterThan(idxInfo0);
+
+      // Child of Item 1 immediately after its parent
+      expect(idxInfo1).toBe(idxItem1 + 1);
+
+      // Sidebar comes after both Item 1 and its child
+      expect(idxSidebar).toBeGreaterThan(idxInfo1);
+
+      expect(calls).toEqual([
+        'Item 0', 'ItemInfo 0',
+        'Item 1', 'ItemInfo 1',
+        'Sidebar',
+      ]);
+    });
+  });
 });
